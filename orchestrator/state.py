@@ -123,6 +123,13 @@ CREATE TABLE IF NOT EXISTS publications (
     record TEXT NOT NULL,
     published_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS errata (
+    errata_id TEXT PRIMARY KEY,
+    round INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_errata_round ON errata(round);
 CREATE TABLE IF NOT EXISTS client_keys (
     client_key TEXT PRIMARY KEY,
     pubkey TEXT NOT NULL,

@@ -6,6 +6,7 @@ from typing import Optional
 
 from .admission import AdmissionService
 from .audit import AuditService
+from .errata import ErrataService
 from .identity import NodeIdentity
 from .leaderboard import LeaderboardService
 from .proposals import ProposalService
@@ -31,6 +32,7 @@ class Orchestrator:
         self.receipts = ReceiptService(store)
         self.publication = PublicationService(store, publication_jsonl)
         self.audit = AuditService(self.publication)
+        self.errata = ErrataService(store)
         self.leaderboard = LeaderboardService(store)
         self.proposals = ProposalService(store)
         self.validation = ValidationService(store)

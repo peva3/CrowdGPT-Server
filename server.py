@@ -182,6 +182,7 @@ try:
     from orchestrator import diloco as diloco_opt
     from orchestrator.adversarial import plausible_loss
     from orchestrator.metrics import MetricsRecorder, RoundMetric
+    from orchestrator.errata import build_errata, sign_errata
     from orchestrator.compression import iter_frames
     from orchestrator.peer_service import PeerService
     from orchestrator.replication import HttpTransport, Peer, PeerConfig
@@ -4508,6 +4509,35 @@ async def cluster_view():
                 "rounds": len(ORCH.store.query("SELECT round FROM peer_rounds")),
                 "submissions": len(ORCH.store.query("SELECT content_sha256 FROM peer_submissions")),
             }}
+
+@app.get("/api/audit/errata")
+async def audit_errata(round: int | None = None):
+    if ORCH is None: return {"errata": []}
+    return {"errata": (ORCH.errata.for_round(round) if round is not None
+                       else ORCH.errata.all())}
+
+@app.post("/api/admin/errata")
+async def admin_errata(request: Request, secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    data = await request.json()
+    try: rnd = int(data.get("round"))
+    except (TypeError, ValueError): raise HTTPException(400, "round is required")
+    published = ORCH.publication.get_round(rnd)
+    if published is None: raise HTTPException(404, f"round {rnd} is not published")
+    original = record_hash(published["record"])
+    supplied = data.get("originalRecordHash")
+    if supplied and str(supplied).lower() != original:
+        raise HTTPException(400, "originalRecordHash does not match the publication")
+    try:
+        rec = build_errata(round_no=rnd, original_record_hash=original,
+                           reason=str(data.get("reason") or ""),
+                           replacement_record_hash=data.get("replacementRecordHash"),
+                           issuer=NODE_ID or "node-unknown")
+        rec = sign_errata(rec, ORCH.identity, NODE_ID or "node-unknown")
+        return ORCH.errata.record(rec)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 @app.get("/api/audit/rounds")
 async def audit_rounds():

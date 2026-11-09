@@ -6,6 +6,7 @@ lives here and can be exercised without importing FastAPI.
 """
 from .admission import AdmissionService
 from .audit import AuditService
+from .errata import ErrataService
 from .domain import PoolView, RoundView, SubmissionView, TicketView, VerificationView
 from .proposals import ProposalService
 from .publication import PublicationService

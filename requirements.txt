@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+numpy
+torch
+cryptography
+slowapi
+psutil
+huggingface_hub
+safetensors

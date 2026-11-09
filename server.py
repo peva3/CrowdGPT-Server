@@ -158,6 +158,7 @@ try:
     from orchestrator import Orchestrator
     from orchestrator.objects import LocalObjectStore
     from orchestrator.nodes import NodeRegistry, local_node_record, node_id_for
+    from orchestrator.cluster import ClusterView, LeaseManager
     from orchestrator.records import (build_round_record, digest_of, merkle_root,
                                       record_hash, sign_record)
     from orchestrator.adversarial import plausible_loss
@@ -3904,6 +3905,18 @@ async function main(){
 }
 main();
 </script></body></html>""", media_type="text/html")
+
+@app.get("/api/cluster")
+async def cluster_view():
+    if ORCH is None: return {"nodes": [], "healthy": [], "lease": None}
+    view = ClusterView(ORCH.store)
+    lease = LeaseManager(ORCH.store).current(round_state["current_round"])
+    return {"nodes": [n.record for n in NodeRegistry(ORCH.store).active()],
+            "healthy": view.healthy(),
+            "round": round_state["current_round"],
+            "lease": None if lease is None else {"leader": lease.leader,
+                                                "term": lease.term,
+                                                "expiresAt": lease.expires_at}}
 
 @app.get("/api/audit/rounds")
 async def audit_rounds():

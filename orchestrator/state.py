@@ -149,6 +149,19 @@ CREATE TABLE IF NOT EXISTS nodes (
     PRIMARY KEY (node_id, pubkey)
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(status, valid_until);
+CREATE TABLE IF NOT EXISTS node_health (
+    node_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    last_seen REAL NOT NULL,
+    endpoint TEXT
+);
+CREATE TABLE IF NOT EXISTS leases (
+    round INTEGER PRIMARY KEY,
+    leader TEXT NOT NULL,
+    term INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -192,6 +205,7 @@ class StateStore:
         wanted = {
             "tickets": {"base_weights": "TEXT", "signature": "TEXT", "public_key": "TEXT"},
             "uploads": {"result": "TEXT"},
+            "nodes": {"record_sig": "TEXT"},
         }
         for table, columns in wanted.items():
             have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}

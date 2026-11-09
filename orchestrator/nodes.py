@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .identity import NodeIdentity
-from .records import build_node_record, canonical_json, digest_of
+from .records import build_node_record, canonical_json, digest_of, verify_client_receipt
 from .state import StateStore
 
 
@@ -40,6 +40,16 @@ class NodeRegistry:
             )
         return Node(body["node_id"], body["pubkey"], body, start, None, status)
 
+    def register_signed(self, record: dict, signature: str) -> Optional[Node]:
+        """Register only when the record's own key signed its canonical JSON."""
+        if not verify_client_receipt(record, record.get("pubkey", ""), signature):
+            return None
+        node = self.register(record)
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE nodes SET record_sig=? WHERE node_id=? AND pubkey=?",
+                         (signature, record["node_id"], record["pubkey"]))
+        return node
+
     def rotate(self, old: Node, new_record: dict, *, overlap_s: float = 3600) -> Node:
         now = time.time()
         with self.store.transaction() as conn:
@@ -57,13 +67,21 @@ class NodeRegistry:
         return Node(row["node_id"], row["pubkey"], json.loads(row["record"]),
                     row["valid_from"], row["valid_until"], row["status"])
 
-    def active(self, at: Optional[float] = None) -> list[Node]:
+    def active(self, at: Optional[float] = None, *, signed_only: bool = False) -> list[Node]:
         now = time.time() if at is None else at
         rows = self.store.query(
             "SELECT * FROM nodes WHERE status='active' AND valid_from<=? "
             "AND (valid_until IS NULL OR valid_until>=?) ORDER BY valid_from", (now, now))
-        return [Node(r["node_id"], r["pubkey"], json.loads(r["record"]),
-                     r["valid_from"], r["valid_until"], r["status"]) for r in rows]
+        out = []
+        for r in rows:
+            rec = json.loads(r["record"])
+            if signed_only:
+                sig = r["record_sig"] if "record_sig" in r.keys() else None
+                if not sig or not verify_client_receipt(rec, rec.get("pubkey", ""), sig):
+                    continue
+            out.append(Node(r["node_id"], r["pubkey"], rec,
+                            r["valid_from"], r["valid_until"], r["status"]))
+        return out
 
 
 def node_id_for(identity: NodeIdentity) -> str:

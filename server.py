@@ -159,6 +159,8 @@ try:
     from orchestrator.objects import LocalObjectStore
     from orchestrator.nodes import NodeRegistry, local_node_record, node_id_for
     from orchestrator.cluster import ClusterView, LeaseManager
+    from orchestrator.admission_policy import AdmissionPolicy
+    from orchestrator.reputation import ReputationService
     from orchestrator.records import (build_round_record, digest_of, merkle_root,
                                       record_hash, sign_record)
     from orchestrator.adversarial import plausible_loss
@@ -468,7 +470,7 @@ def _persist_ticket(client_key: str, task_id: str, pool: Optional[dict] = None):
                                      pool_id=(pool or {}).get("pool_id"),
                                      step_budget=(pool or {}).get("target_steps", CROSS_CHECK["TARGET_LOCAL_STEPS"]),
                                      token_budget=HARDEN["MAX_TOKENS_PER_STEP"] * max(1, (pool or {}).get("target_steps", 1)),
-                                     ttl_s=MATCHMAKING["POOL_TIMEOUT_S"],
+                                     ttl_s=HARDEN["TICKET_TTL_S"],
                                      base_weights=f"step:{global_step}")
         t = task_tickets.get(client_key)
         if t is not None and t.get("taskId") == task_id:
@@ -680,6 +682,8 @@ HARDEN = {
     "MAX_SUBMISSIONS_PER_SUBNET_ROUND": _env_int("CROWDGPT_MAX_SUBMISSIONS_PER_SUBNET_ROUND", 500),
     "MAX_LOCAL_STEPS": _env_int("CROWDGPT_MAX_LOCAL_STEPS", 200_000),
     "MAX_TOKENS_PER_STEP": _env_int("CROWDGPT_MAX_TOKENS_PER_STEP", int(128 * DATASET_CONFIG["tokensPerSample"] * 1.25)),
+    "TICKET_TTL_S": _env_int("CROWDGPT_TICKET_TTL_S", 15 * 60),
+    "MAX_LOCAL_STEPS": _env_int("CROWDGPT_MAX_LOCAL_STEPS", 500),
     "MAX_TOKENS_PER_SEC": _env_float("CROWDGPT_MAX_TOKENS_PER_SEC", 1_000_000.0),
     "REQUIRE_TASK_TICKET": os.getenv("CROWDGPT_REQUIRE_TASK_TICKET", "0") == "1",
     "ENGRAM_ROW_NORM_MAX": _env_float("CROWDGPT_ENGRAM_ROW_NORM_MAX", 8.0),
@@ -1335,7 +1339,7 @@ def _activate_pool(pool: dict):
     client_bs = max(1, hw.get("bs", 1))
     hw_multiplier = max(0.25, vram_gb / 8.0)
     scaled_steps = int(BASE_STEPS * hw_multiplier)
-    target_steps = max(100, min(2500, scaled_steps))
+    target_steps = max(100, min(HARDEN["MAX_LOCAL_STEPS"], scaled_steps))
     pool_autocast = _pool_target_autocast(pool)
     pool_optimizer = _pool_target_optimizer(pool)
     pool["target_autocast"] = pool_autocast
@@ -3905,6 +3909,50 @@ async function main(){
 }
 main();
 </script></body></html>""", media_type="text/html")
+
+@app.get("/api/admin/nodes")
+async def admin_nodes(secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if ORCH is None: return {"nodes": [], "policy": AdmissionPolicy.from_env().mode}
+    reg = NodeRegistry(ORCH.store); rep = ReputationService(ORCH.store)
+    return {"policy": AdmissionPolicy.from_env().mode,
+            "nodes": [{**n.record, "valid_from": n.valid_from,
+                       "valid_until": n.valid_until, "status": n.status,
+                       "reputation": rep.get(n.node_id).__dict__}
+                      for n in reg.active(at=time.time())]}
+
+@app.post("/api/admin/node/register")
+async def admin_node_register(request: Request, secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    data = await request.json()
+    node = NodeRegistry(ORCH.store).register_signed(data.get("record") or {}, data.get("signature") or "")
+    if node is None: raise HTTPException(400, {"reason": "node_signature_invalid"})
+    return {"status": "registered", "node": node.record}
+
+@app.post("/api/admin/node/rotate")
+async def admin_node_rotate(request: Request, secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    data = await request.json()
+    reg = NodeRegistry(ORCH.store)
+    old = reg.resolve(data.get("node_id", ""), data.get("pubkey", ""))
+    if old is None: raise HTTPException(404, {"reason": "old_node_unknown"})
+    new = reg.register_signed(data.get("record") or {}, data.get("signature") or "")
+    if new is None: raise HTTPException(400, {"reason": "node_signature_invalid"})
+    reg.rotate(old, new.record, overlap_s=float(data.get("overlap_s", 3600)))
+    return {"status": "rotated", "old_until": time.time() + float(data.get("overlap_s", 3600)),
+            "node": new.record}
+
+@app.post("/api/admin/node/revoke")
+async def admin_node_revoke(request: Request, secret: str = ""):
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    data = await request.json()
+    reg = NodeRegistry(ORCH.store); node = reg.resolve(data.get("node_id", ""), data.get("pubkey", ""))
+    if node is None: raise HTTPException(404, {"reason": "node_unknown"})
+    rep = ReputationService(ORCH.store).slash(node, data.get("reason", "revoked"))
+    return {"status": "revoked", "reputation": rep.__dict__}
 
 @app.get("/api/cluster")
 async def cluster_view():

@@ -2,7 +2,7 @@
 
 ## Must pass locally
 
-- [x] `make check` (server tests, ng tests, compile, selfcheck)
+- [x] `make check` (server tests, ng tests, compile, compatibility, selfcheck)
 - [x] `python tools/sbom.py > sbom.json`
 - [x] Docker image builds and the container reports `/cluster/health`
 - [x] `GET /metrics` returns text/plain with no identities

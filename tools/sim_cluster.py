@@ -31,8 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from orchestrator.identity import NodeIdentity  # noqa: E402
+from orchestrator.cluster import certify
 from orchestrator.nodes import local_node_record, node_id_for  # noqa: E402
-from orchestrator.records import canonical_json  # noqa: E402
+from orchestrator.records import ZERO_ROOT, build_round_record, canonical_json  # noqa: E402
 
 
 @dataclass
@@ -242,6 +243,33 @@ def run_cluster(root: Path, base_port: int, quorum: int = 2, ttl: float = 3.0) -
                             and third.get("created") is False and counts == [1, 1, 1],
         }
 
+        # 2-of-3 witness certificates across real processes.
+        record = build_round_record(
+            round_no=99, opened_at="2026-11-09T00:00:00Z",
+            closed_at="2026-11-09T00:10:00Z", base_weights="a" * 64,
+            aggregate_weights="b" * 64, leader=specs[0].node_id, witnesses=(),
+            tickets_root="1" * 64, submissions_root="2" * 64, deltas_root="3" * 64,
+            prev_record_hash=ZERO_ROOT, eval=None, bytes_down=1, bytes_up=2,
+            code_versions=("sim-1",))
+        certs = []
+        for spec in specs[:2]:
+            status, body = _post(spec.endpoint, "/sim/witness/sign", {"record": record})
+            if status == 200 and body:
+                certs.append(body["certificate"])
+        allowed = {s.node_id: NodeIdentity.load_or_create(s.pem).public_key_hex for s in specs}
+        certified = certify(record, certs, required=2, allowed=allowed)
+        short = None
+        try:
+            certify(record, certs[:1], required=2, allowed=allowed)
+        except ValueError as exc:
+            short = str(exc)
+        results["drills"]["witness_quorum"] = {
+            "certificates": len(certified["certificate"]),
+            "two_of_three_ok": len(certified["certificate"]) >= 2,
+            "one_of_three_rejected": short is not None,
+            "reason": short,
+        }
+
         # Restart under write load.
         initial = submissions(specs[0])
         load = [f"{i:064x}" for i in range(40)]
@@ -321,6 +349,8 @@ def main() -> int:
     ok = (report["cluster"]["drills"]["registry"]["converged"]
           and report["cluster"]["drills"]["leader_kill_x3"]["all_takeovers_succeeded"]
           and report["cluster"]["drills"]["duplicate_finalize"]["exactly_once"]
+          and report["cluster"]["drills"]["witness_quorum"]["two_of_three_ok"]
+          and report["cluster"]["drills"]["witness_quorum"]["one_of_three_rejected"]
           and report["cluster"]["drills"]["restart_under_load"]["no_loss"]
           and report["cluster"]["drills"]["restart_under_load"]["no_duplicates"]
           and report["partition"]["neither_certified"])

@@ -154,6 +154,14 @@ async def registry_announce(request: Request):
     return {"ok": True, "node": STATE["config"].node_id}
 
 
+@APP.post("/sim/witness/sign")
+async def witness_sign(request: Request):
+    body = await request.json()
+    record = body.get("record") or {}
+    from orchestrator.records import sign_record
+    signed = sign_record(record, STATE["orch"].identity, STATE["config"].node_id)
+    return {"certificate": signed["certificate"][-1]}
+
 @APP.get("/sim/registry")
 async def registry():
     return {"seen": STATE["registry"].seen_ids(), "self": STATE["config"].node_id}

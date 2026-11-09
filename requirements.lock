@@ -1,0 +1,15 @@
+# Reviewed runtime pins (2026-11-09).
+# Install with: pip install -r requirements.lock
+# Torch wheels are platform-specific; the cu124 build is the reviewed GPU build.
+fastapi==0.162.0
+uvicorn==0.54.0
+requests==2.34.2
+numpy==2.5.2
+torch==2.6.0
+cryptography==46.0.3
+psutil==7.2.2
+huggingface_hub==1.4.1
+safetensors==0.5.3
+zstandard==0.22.0
+# slowapi is imported by server.py in the full deployment and is stubbed in
+# tests. Pin the version used by the operator image before a public pilot.

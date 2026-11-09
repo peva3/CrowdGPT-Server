@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+checkpoints/
+data/objects/
+orchestrator_state.sqlite3*
+orchestrator_node_key.pem
+orchestrator_object_secret
+public_events.jsonl
+public_log.json
+public_log_salt.txt
+loss_history.json

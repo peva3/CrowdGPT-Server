@@ -150,3 +150,23 @@ single-machine simulations, not a production RTO.
 `tests/test_orchestrator_replication.py` → 5 passed: majority acknowledgement,
 lease release without quorum, conflicting-lease rejection, signed registry
 announce, bad-signature rejection.
+
+## P6.2 — held-out evaluation and nutrition label
+
+`_publish_round_record()` now attaches an evaluation instead of `eval=None`:
+
+- a configured loss-check result (`LOSS_CHECK_MODE` not `off`) becomes
+  `{mode, loss, source: "loss_check"}`;
+- otherwise `CROWDGPT_EVAL_URL` is called at `POST /eval` and its
+  `{loss, ciLow, ciHigh, windows, manifestSha256, modelSha256}` is stored;
+- with neither configured, `eval` stays `null` and `nutrition.json` says
+  `{"status": "unevaluated"}`. A reported training loss never fills this field.
+
+`data/nutrition.json` is written atomically at round close with the base
+revision, global step, weight digests, verified vs reported tokens, contributor
+count, trained parameters, evaluation, and explicit limitations. It is copied
+into the Hugging Face upload folder next to `rounds.jsonl`.
+
+`tools/eval_local.py` evaluates a hash-pinned manifest (`--mode uniform` for
+the ln(vocab) reference, `--mode checkpoint` for a real flat checkpoint) and
+`tools/eval_service.py` is the HTTP sidecar the orchestrator calls.

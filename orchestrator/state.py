@@ -149,6 +149,15 @@ CREATE TABLE IF NOT EXISTS nodes (
     PRIMARY KEY (node_id, pubkey)
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(status, valid_until);
+CREATE TABLE IF NOT EXISTS node_reputation (
+    node_id TEXT PRIMARY KEY,
+    certified_rounds INTEGER NOT NULL DEFAULT 0,
+    uptime_s REAL NOT NULL DEFAULT 0,
+    audits_passed INTEGER NOT NULL DEFAULT 0,
+    audits_failed INTEGER NOT NULL DEFAULT 0,
+    score REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS node_health (
     node_id TEXT PRIMARY KEY,
     generation INTEGER NOT NULL,

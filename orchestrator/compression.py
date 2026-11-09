@@ -23,7 +23,9 @@ def compress_delta(values, *, block: int = BLOCK, level: int = 6) -> bytes:
     padded = np.zeros(nb * block, dtype=np.float32)
     padded[:n] = arr
     matrix = padded.reshape(nb, block)
-    scales = np.mean(np.abs(matrix), axis=1).astype(np.float16)
+    counts = np.full(nb, block, dtype=np.float64)
+    counts[-1] = n - (nb - 1) * block
+    scales = (np.abs(matrix).sum(axis=1) / counts).astype(np.float16)
     bits = (matrix >= 0).astype(np.uint8)
     packed = np.packbits(bits.reshape(-1), bitorder="little").tobytes()
     raw = MAGIC + struct.pack("<QI", n, block) + scales.tobytes() + packed

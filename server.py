@@ -612,6 +612,9 @@ def _restore_orchestrator_state() -> bool:
                 pools[pv.pool_id] = p
                 for c in pv.clients: client_pool_map[c] = pv.pool_id
                 if pv.task_id:
+                    _sig = tuple(pv.hardware_sig)
+                    _rmode = str(_sig[7] if len(_sig) > 7 else "dense").lower()
+                    _rrank = int(_sig[8] if len(_sig) > 8 else 0) if _rmode == "lora" else 0
                     db["tasks"][pv.task_id] = {
                         "poolId": pv.pool_id, "shardId": pv.pool_id,
                         "chunkIdx": pv.chunk_idx, "round": pv.round,
@@ -622,6 +625,10 @@ def _restore_orchestrator_state() -> bool:
                         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
                         "targetAutocast": pv.target_autocast or CROSS_CHECK["TARGET_AUTOCAST"],
                         "targetOptimizer": pv.target_optimizer or CROSS_CHECK["TARGET_OPTIMIZER"],
+                        "trainMode": _rmode, "loraRank": _rrank,
+                        "trainedParams": (["adapters"] + (["engram"] if ENG_PARAMS else [])
+                                          if _rmode == "lora"
+                                          else ["base"] + (["engram"] if ENG_PARAMS else [])),
                     }
         with shard_lock:
             task_tickets.clear()
@@ -896,6 +903,10 @@ def _parse_bool_header(v) -> Optional[bool]:
     if s in ("1", "true", "yes"): return True
     if s in ("0", "false", "no"): return False
     return None
+
+def _safe_int(value, default=0):
+    try: return int(value)
+    except (TypeError, ValueError): return int(default)
 
 def _client_opt_caps(client_key: str) -> tuple:
     """Returns (can_fp32, can_8bit).
@@ -1263,7 +1274,9 @@ def _hw_signature(client_key: str) -> tuple:
     optim    = (hw.get("optim")    or "any").lower()
     gpu      = hw.get("gpu") or ""
     cc       = (hw.get("compute_cap") or "").lower()
-    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc)
+    mode     = (hw.get("train_mode") or "dense").lower()
+    rank     = int(hw.get("lora_rank") or 0) if mode == "lora" else 0
+    return (backend, bucket, autocast, optim, _gpu_arch_class(gpu), _gpu_card_class(gpu), cc, mode, rank)
 
 def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     """v2.3 ASYMMETRIC matching — backend exact, optimizer normalize+wildcard,
@@ -1285,6 +1298,14 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
     Arch is intentionally ignored (cross-arch tolerated at 5× threshold)."""
     if len(client_sig) < 4 or len(pool_sig) < 4: return False
     if client_sig[0] != pool_sig[0]: return False  # backend exact
+    # A LoRA direction and a full-parameter update are not comparable in the
+    # cross-check, so a training-mode mismatch never shares a pool.
+    client_mode = str(client_sig[7] if len(client_sig) > 7 else "dense").lower()
+    pool_mode   = str(pool_sig[7]   if len(pool_sig)   > 7 else "dense").lower()
+    if client_mode != pool_mode: return False
+    client_rank = int(client_sig[8] if len(client_sig) > 8 else 0)
+    pool_rank   = int(pool_sig[8]   if len(pool_sig)   > 8 else 0)
+    if client_rank != pool_rank: return False
 
     def _norm_opt(s):
         s = str(s or "any").lower()
@@ -1363,6 +1384,11 @@ def _activate_pool(pool: dict):
              f"targetOptimizer={pool_optimizer}")
     pool.update({"status": "training", "chunk_idx": chunk_idx, "task_id": task_id,
         "target_seed": target_seed, "activated_at": time.time(), "target_steps": target_steps})
+    _mode_hw = client_hardware.get(pool["clients"][0], {}) if pool.get("clients") else {}
+    _train_mode = str(_mode_hw.get("train_mode") or "dense").lower()
+    _lora_rank = int(_mode_hw.get("lora_rank") or 0) if _train_mode == "lora" else 0
+    _trained = (["adapters"] + (["engram"] if ENG_PARAMS else []) if _train_mode == "lora"
+                else ["base"] + (["engram"] if ENG_PARAMS else []))
     db["tasks"][task_id] = {
         "poolId": pool_id, "shardId": pool_id, "chunkIdx": chunk_idx,
         "round": round_state["current_round"], "createdAt": int(time.time() * 1000),
@@ -1371,6 +1397,7 @@ def _activate_pool(pool: dict):
         "targetAccumSteps": CROSS_CHECK["TARGET_ACCUM_STEPS"],
         "targetAutocast": pool_autocast,
         "targetOptimizer": pool_optimizer,
+        "trainMode": _train_mode, "loraRank": _lora_rank, "trainedParams": _trained,
     }
     with shard_lock:
         current_data_shard.update({"chunkIdx": chunk_idx, "shardId": pool_id,
@@ -1673,11 +1700,17 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
         return new_pool
 
 def _build_task_payload(pool: dict, client_key: str) -> dict:
+    _mode_hw = client_hardware.get(pool["clients"][0], {}) if pool.get("clients") else {}
+    _train_mode = _mode_hw.get("train_mode", "dense")
+    _lora_rank = int(_mode_hw.get("lora_rank") or 0)
     metadata = {
         "taskId": pool["task_id"], "globalStep": global_step,
         "currentRound": round_state["current_round"],
         "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS, "modelConfig": MODEL_CONFIG,
         "weightFormat": "bf16",
+        "trainMode": _train_mode, "loraRank": _lora_rank if _train_mode == "lora" else 0,
+        "trainedParams": (["adapters"] + (["engram"] if ENG_PARAMS else [])
+                          if _train_mode == "lora" else (["base"] + (["engram"] if ENG_PARAMS else []))),
         "datasetConfig": {"repoId": DATASET_CONFIG["repoId"], "chunkIdx": pool["chunk_idx"],
             "totalChunks": dataset_info["totalChunks"], "subChunkSize": DATASET_CONFIG["subChunkMB"] * 1024 * 1024,
             "epoch": data_position["epoch"], "tokensPerSample": DATASET_CONFIG["tokensPerSample"],
@@ -2754,8 +2787,6 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             try: lora_rank = int(body.get("loraRank", 0) or 0)
             except (TypeError, ValueError): lora_rank = 0
             is_lora = bool(body.get("isLoRA")) or lora_rank > 0
-            if is_lora and has_engram:
-                raise HTTPException(status_code=400, detail="LoRA payload cannot carry engram rows")
             if is_lora and fmt not in ("bf16", "fp16"):
                 raise HTTPException(status_code=400, detail="LoRA payload must be bf16 or fp16")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
@@ -2764,6 +2795,15 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             with open(temp_delta_path, 'wb') as td:
                 if is_lora:
                     blob = dec_f.read()
+                    _tail_len = 0
+                    if has_engram and engram_sparse_count > 0:
+                        _tail_len = (4 + engram_sparse_count * 4
+                                     + engram_sparse_count * MODEL_CONFIG["dim"] * bpp)
+                    if _tail_len:
+                        if len(blob) < _tail_len + 4:
+                            raise HTTPException(status_code=400, detail="Truncated LoRA engram tail")
+                        dec_f.seek(-_tail_len, os.SEEK_CUR)
+                        blob = blob[:-_tail_len]
                     try:
                         adapters = lora_wire.decode_payload(blob, model_size=MODEL_SIZE)
                         if lora_rank and max(int(a["a"].shape[0]) for a in adapters) != lora_rank:
@@ -2833,6 +2873,17 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             task_id = body.get("taskId")
             task_meta = db["tasks"].get(task_id)
             if task_meta is None: raise HTTPException(status_code=404, detail="Task expired")
+            _expected_mode = str(task_meta.get("trainMode") or "dense").lower()
+            if is_lora != (_expected_mode == "lora"):
+                raise HTTPException(status_code=400, detail={"reason": "train_mode_mismatch"})
+            if is_lora:
+                _expected_rank = int(task_meta.get("loraRank") or 0)
+                if _expected_rank and lora_rank != _expected_rank:
+                    raise HTTPException(status_code=400, detail={"reason": "lora_rank_mismatch"})
+                _allowed = set(task_meta.get("trainedParams") or [])
+                _claimed = set(body.get("trainedParams") or [])
+                if _claimed and not _claimed <= _allowed:
+                    raise HTTPException(status_code=400, detail={"reason": "trained_params_mismatch"})
             if task_meta.get("round") != round_state["current_round"]:
                 log.info(f"🚫 {client_key}: stale submission — task round {task_meta.get('round')}, current round {round_state['current_round']}")
                 return _duplicate_response("stale_round")
@@ -2918,7 +2969,9 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "shardId": shard_id_for_meta, "taskId": task_id, "crossCheckUsed": cc_used,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
                 "actualBatchSize": cc_actual_bs, "actualOptimizer": cc_actual_opt,
-                "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),   # ← add this
+                "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),
+                "trainMode": "lora" if is_lora else "dense", "isLoRA": bool(is_lora),
+                "loraRank": int(lora_rank), "trainedParams": list(body.get("trainedParams") or []),
             }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm
@@ -3574,6 +3627,10 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
                         or _infer_compute_cap(
                             request.headers.get("X-Client-Gpu-Name") or "",
                             request.headers.get("X-Client-Backend") or "")),
+        # P6.1: training mode is part of the pool identity, not a hint.
+        "train_mode": ("lora" if (request.headers.get("X-Client-Train-Mode") or "").strip().lower()
+                       in ("lora", "adapter", "adapters") else "dense"),
+        "lora_rank": _safe_int(request.headers.get("X-Client-Lora-Rank"), 0),
         "last_seen": time.time(),
     }
     hw = client_hardware[client_key]

@@ -3628,6 +3628,17 @@ app = FastAPI(title="CrowdGPT Continuous FL Coordinator (v2.3)")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.middleware("http")
+async def _admin_header_secret(request: Request, call_next):
+    """Accept X-Admin-Secret without putting the secret in a logged query string."""
+    header = request.headers.get("X-Admin-Secret")
+    if header and request.url.path.startswith("/api/admin/") and not request.query_params.get("secret"):
+        from urllib.parse import urlencode
+        extra = urlencode({"secret": header}).encode()
+        current = request.scope.get("query_string", b"")
+        request.scope["query_string"] = (current + b"&" + extra) if current else extra
+    return await call_next(request)
+
+@app.middleware("http")
 async def _measure_control_plane(request: Request, call_next):
     """Count control-plane bytes; bulk object PUTs are deliberately excluded."""
     path = request.url.path

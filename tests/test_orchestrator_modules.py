@@ -178,3 +178,22 @@ def test_two_connections_see_one_state(tmp_path):
         assert b.scheduling.get_pool("p9").clients == ("ip:a",)
     finally:
         a.close(); b.close()
+
+
+def test_reference_krum_stream_delta_round_trip(tmp_path):
+    import struct
+    import torch
+    import krum_stream
+
+    meta = {"tokensProcessed": 10}
+    raw = __import__("json").dumps(meta).encode()
+    values = torch.full((8,), 0.5).to(torch.bfloat16).view(torch.int16).numpy().tobytes()
+    path = tmp_path / "delta.bin"
+    path.write_bytes(struct.pack("<I", len(raw)) + raw + values + struct.pack("<I", 0))
+    df = krum_stream.open_delta(str(path), 8)
+    assert df.tokens == 10
+    weights = torch.zeros(8)
+    krum_stream.stream_add_base_delta(weights, df, 1.0)
+    assert torch.allclose(weights, torch.full((8,), 0.5), atol=0.01)
+    dist, bad, sq = krum_stream.streaming_pairwise_sq_l2([df], max_ram_bytes=1024)
+    assert bad == [False] and float(sq[0]) > 0

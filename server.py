@@ -167,6 +167,7 @@ try:
     from orchestrator import diloco as diloco_opt
     from orchestrator.adversarial import plausible_loss
     from orchestrator.metrics import MetricsRecorder, RoundMetric
+    from orchestrator.compression import iter_frames
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     diloco_opt = None
@@ -2886,6 +2887,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
+            codec = str(body.get("deltaCodec") or "").lower()
             try: lora_rank = int(body.get("loraRank", 0) or 0)
             except (TypeError, ValueError): lora_rank = 0
             is_lora = bool(body.get("isLoRA")) or lora_rank > 0
@@ -2926,6 +2928,25 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     for i in range(0, MODEL_SIZE, 10_000_000):
                         td.write(dense[i:i + 10_000_000].tobytes())
                     del dense
+                    offset = MODEL_SIZE
+                elif codec == "ngd1":
+                    blob = dec_f.read()
+                    total_params = 0
+                    try:
+                        for block in iter_frames(blob):
+                            if block.size <= 0:
+                                continue
+                            arr = np.asarray(block, dtype=np.float32)
+                            if not np.isfinite(arr).all():
+                                raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
+                            norm_sq += float(np.sum(arr.astype(np.float32) ** 2))
+                            td.write(torch.from_numpy(arr).to(torch.bfloat16)
+                                     .view(torch.int16).numpy().tobytes())
+                            total_params += int(arr.size)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=f"Invalid ngd1 payload: {exc}")
+                    if total_params != MODEL_SIZE:
+                        raise HTTPException(status_code=400, detail="ngd1 payload size mismatch")
                     offset = MODEL_SIZE
                 else:
                     while offset < MODEL_SIZE:
@@ -3074,6 +3095,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "expected_optimizer": _norm_opt(task_meta.get("targetOptimizer")),
                 "trainMode": "lora" if is_lora else "dense", "isLoRA": bool(is_lora),
                 "loraRank": int(lora_rank), "trainedParams": list(body.get("trainedParams") or []),
+                "deltaCodec": codec or "off",
             }
             if delta_norm > max_allowed:
                 scale_factor = max_allowed / delta_norm

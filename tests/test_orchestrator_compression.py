@@ -26,3 +26,20 @@ def test_size_target_for_model_scale():
 def test_exact_round_trip_for_zero():
     values = np.zeros(2048, dtype="float32")
     assert np.array_equal(decompress_delta(compress_delta(values)), values)
+
+
+def test_framed_container_round_trip_and_errors():
+    from orchestrator.compression import iter_frames, pack_frames, unpack_frames
+    import pytest
+
+    blocks = [np.full(64, 0.25, dtype=np.float32), np.zeros(32, dtype=np.float32)]
+    blob = pack_frames(blocks)
+    assert blob.startswith(b"NGD2")
+    back = unpack_frames(blob)
+    assert back.size == 96
+    assert np.allclose(back[:64], 0.25)
+    assert np.all(back[64:] == 0)
+    with pytest.raises(ValueError):
+        list(iter_frames(blob[:-5]))
+    with pytest.raises(ValueError):
+        list(iter_frames(b"bad"))

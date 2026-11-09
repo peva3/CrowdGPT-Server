@@ -186,3 +186,15 @@ legacy array for existing clients.
 the actor's verified token total; a zero-weight actor gets
 `403 verified_contributor_required`, and voting again replaces the ballot rather
 than adding a second one.
+
+## P6.5 — 1-bit codec on the wire
+
+`orchestrator/compression.py` now frames independent 1-bit blocks under `NGD2`.
+A dense client with `CROWDGPT_DELTA_CODEC=ngd1` writes
+`4-byte metadata length + metadata + NGD2 frames`; the server branch in
+`process_decompressed_payload` decodes each frame, checks finiteness and total
+params, and writes the dense bf16 stream. LoRA and engram paths are unchanged.
+
+Measured on a synthetic 4M-param fixture: 31.6x ratio, 0.126 bytes/param,
+projected 83.2 MB for 657,787,392 params, mean abs error 0.0048 against mean
+abs value 0.0080. A captured production delta is still unmeasured.

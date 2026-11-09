@@ -20,15 +20,12 @@ def compress_delta(values, *, block: int = BLOCK, level: int = 6) -> bytes:
     arr = np.asarray(values, dtype=np.float32).reshape(-1)
     n = arr.size
     nb = (n + block - 1) // block
-    scales = np.zeros(nb, dtype=np.float16)
-    bits = np.zeros(nb * block, dtype=np.uint8)
-    for b in range(nb):
-        chunk = arr[b * block:(b + 1) * block]
-        scale = float(np.mean(np.abs(chunk))) if chunk.size else 0.0
-        scales[b] = scale
-        signs = chunk >= 0
-        bits[b * block:b * block + chunk.size] = signs.astype(np.uint8)
-    packed = np.packbits(bits, bitorder="little").tobytes()
+    padded = np.zeros(nb * block, dtype=np.float32)
+    padded[:n] = arr
+    matrix = padded.reshape(nb, block)
+    scales = np.mean(np.abs(matrix), axis=1).astype(np.float16)
+    bits = (matrix >= 0).astype(np.uint8)
+    packed = np.packbits(bits.reshape(-1), bitorder="little").tobytes()
     raw = MAGIC + struct.pack("<QI", n, block) + scales.tobytes() + packed
     return zlib.compress(raw, level)
 
@@ -46,8 +43,52 @@ def decompress_delta(blob: bytes) -> np.ndarray:
     return out.astype(np.float32)
 
 
+FRAME_MAGIC = b"NGD2"
+
+
+def pack_frames(blocks) -> bytes:
+    """Frame several independent 1-bit blocks under one container."""
+    frames = [compress_delta(block) for block in blocks]
+    total = sum(int(np.asarray(block).size) for block in blocks)
+    parts = [FRAME_MAGIC, struct.pack("<QI", total, len(frames))]
+    for frame in frames:
+        parts.append(struct.pack("<I", len(frame)))
+        parts.append(frame)
+    return b"".join(parts)
+
+
+def iter_frames(blob: bytes):
+    """Yield decoded blocks; raises on a truncated or trailing container."""
+    if not blob.startswith(FRAME_MAGIC):
+        raise ValueError("bad frame magic")
+    pos = len(FRAME_MAGIC)
+    total, count = struct.unpack_from("<QI", blob, pos); pos += 12
+    seen = 0
+    for _ in range(count):
+        if len(blob) < pos + 4:
+            raise ValueError("truncated frame header")
+        (size,) = struct.unpack_from("<I", blob, pos); pos += 4
+        frame = blob[pos:pos + size]
+        if len(frame) != size:
+            raise ValueError("truncated frame")
+        block = decompress_delta(frame)
+        seen += int(block.size)
+        yield block
+        pos += size
+    if pos != len(blob):
+        raise ValueError("trailing bytes after frames")
+    if seen != total:
+        raise ValueError(f"frame total mismatch: {seen} != {total}")
+
+
+def unpack_frames(blob: bytes) -> np.ndarray:
+    parts = list(iter_frames(blob))
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+
+
 def compression_ratio(original_bytes: int, compressed: bytes) -> float:
     return float(original_bytes) / max(1, len(compressed))
 
 
-__all__ = ["BLOCK", "compress_delta", "compression_ratio", "decompress_delta"]
+__all__ = ["BLOCK", "FRAME_MAGIC", "compress_delta", "compression_ratio",
+           "decompress_delta", "iter_frames", "pack_frames", "unpack_frames"]

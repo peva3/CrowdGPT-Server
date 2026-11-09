@@ -163,9 +163,12 @@ try:
     from orchestrator.reputation import ReputationService
     from orchestrator.records import (build_round_record, digest_of, merkle_root,
                                       record_hash, sign_record)
+    from orchestrator import lora as lora_wire
+    from orchestrator import diloco as diloco_opt
     from orchestrator.adversarial import plausible_loss
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
+    diloco_opt = None
     _ORCH_IMPORT_ERROR = _orch_import_err
 else:
     _ORCH_IMPORT_ERROR = None
@@ -652,6 +655,17 @@ FL_CONFIG = {
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
     "SHUFFLE_CHUNKS": True,
 }
+def _outer_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+OUTER_CONFIG = {
+    "OPTIMIZER": os.getenv("CROWDGPT_OUTER_OPTIMIZER", "sgd").strip().lower(),
+    "MOMENTUM": _outer_float("CROWDGPT_OUTER_MOMENTUM", 0.9),
+    "NESTEROV": os.getenv("CROWDGPT_OUTER_NESTEROV", "1") == "1",
+}
+OUTER_MOMENTUM_FILE = CHECKPOINT_DIR / "outer_momentum.bin"
 ROUND_CONFIG = {
     "MAX_ROUND_HOURS": 4.0, "TARGET_SUBMISSION_HOURS": 1.0,
     "MIN_CLIENTS_TO_AGGREGATE": 1, "CLIENT_TIMEOUT_HOURS": 2.5,
@@ -2737,21 +2751,52 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             if engram_sparse_count < 0 or engram_sparse_count > ENG_NUM_BUCKETS:
                 raise HTTPException(status_code=400, detail="Invalid engramSparseCount")
             bpp = _bytes_per_param(fmt)
+            try: lora_rank = int(body.get("loraRank", 0) or 0)
+            except (TypeError, ValueError): lora_rank = 0
+            is_lora = bool(body.get("isLoRA")) or lora_rank > 0
+            if is_lora and has_engram:
+                raise HTTPException(status_code=400, detail="LoRA payload cannot carry engram rows")
+            if is_lora and fmt not in ("bf16", "fp16"):
+                raise HTTPException(status_code=400, detail="LoRA payload must be bf16 or fp16")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".delta") as tdf:
                 temp_delta_path = tdf.name
             norm_sq = 0.0; offset = 0; has_nan_inf = False
             with open(temp_delta_path, 'wb') as td:
-                while offset < MODEL_SIZE:
-                    read_params = min(10_000_000, MODEL_SIZE - offset)
-                    chunk_bytes = dec_f.read(read_params * bpp)
-                    if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
-                        raise HTTPException(status_code=400, detail="Incomplete base delta payload")
-                    td.write(chunk_bytes)
-                    chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
-                    if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
-                        has_nan_inf = True; break
-                    norm_sq += torch.sum(chunk_t * chunk_t).item()
-                    offset += read_params; del chunk_t
+                if is_lora:
+                    blob = dec_f.read()
+                    try:
+                        adapters = lora_wire.decode_payload(blob, model_size=MODEL_SIZE)
+                        if lora_rank and max(int(a["a"].shape[0]) for a in adapters) != lora_rank:
+                            raise ValueError("loraRank does not match adapter factors")
+                    except Exception as exc:
+                        raise HTTPException(status_code=400, detail=f"Invalid LoRA payload: {exc}")
+                    # Expand to the dense stream the existing cross-check and
+                    # aggregation path consumes.  fp16 halves the temporary size.
+                    dense = np.zeros(MODEL_SIZE, dtype=np.float16)
+                    for item in adapters:
+                        a = item["a"].astype(np.float32); b = item["b"].astype(np.float32)
+                        r = int(a.shape[0]); rows, cols = int(b.shape[0]), int(a.shape[1])
+                        patch = (b @ a * (lora_wire.ALPHA / r)).reshape(-1)
+                        if not np.isfinite(patch).all():
+                            raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
+                        norm_sq += float(np.sum(patch.astype(np.float32) ** 2))
+                        dense[item["offset"]:item["offset"] + rows * cols] = patch.astype(np.float16)
+                    for i in range(0, MODEL_SIZE, 10_000_000):
+                        td.write(dense[i:i + 10_000_000].tobytes())
+                    del dense
+                    offset = MODEL_SIZE
+                else:
+                    while offset < MODEL_SIZE:
+                        read_params = min(10_000_000, MODEL_SIZE - offset)
+                        chunk_bytes = dec_f.read(read_params * bpp)
+                        if not chunk_bytes or len(chunk_bytes) < read_params * bpp:
+                            raise HTTPException(status_code=400, detail="Incomplete base delta payload")
+                        td.write(chunk_bytes)
+                        chunk_t = _decode_delta_chunk(bytearray(chunk_bytes), fmt)
+                        if torch.isnan(chunk_t).any() or torch.isinf(chunk_t).any():
+                            has_nan_inf = True; break
+                        norm_sq += torch.sum(chunk_t * chunk_t).item()
+                        offset += read_params; del chunk_t
             if has_nan_inf:
                 ban_subnet(client_ip, "submitted NaN/Inf delta")
                 raise HTTPException(status_code=400, detail="Invalid delta (NaN/Inf)")
@@ -3220,6 +3265,41 @@ def _compute_norm_server(path: str, model_size: int) -> float:
     except Exception: return 0.0
     return math.sqrt(max(0.0, total_sq))
 
+def _outer_enabled():
+    return OUTER_CONFIG.get("OPTIMIZER") == "diloco" and diloco_opt is not None
+
+
+def _outer_buffer_paths():
+    pseudo = WORK_TMP / "outer_pseudograd.f32"
+    return pseudo, OUTER_MOMENTUM_FILE
+
+
+def _apply_outer_update(pseudo, lr):
+    """Apply one persistent-momentum outer step chunk by chunk.
+
+    ``pseudo`` is an fp32 memmap holding the weighted pseudogradient. The
+    momentum buffer is also a memmap so a 658M model does not need another
+    multi-GB heap allocation.
+    """
+    size = MODEL_SIZE * 4
+    mode = "r+" if OUTER_MOMENTUM_FILE.exists() and OUTER_MOMENTUM_FILE.stat().st_size == size else "w+"
+    momentum = np.memmap(str(OUTER_MOMENTUM_FILE), dtype=np.float32, mode=mode, shape=(MODEL_SIZE,))
+    chunk = 10_000_000
+    with shard_lock:
+        for i in range(0, MODEL_SIZE, chunk):
+            end = min(MODEL_SIZE, i + chunk)
+            p = global_weights[i:end].detach().cpu().numpy()
+            g = np.asarray(pseudo[i:end], dtype=np.float32)
+            m = np.asarray(momentum[i:end], dtype=np.float32)
+            updated, buf = diloco_opt.outer_step(
+                p, g, lr=lr, momentum=OUTER_CONFIG["MOMENTUM"],
+                nesterov=OUTER_CONFIG["NESTEROV"], buffer=m)
+            global_weights[i:end] = torch.from_numpy(np.ascontiguousarray(updated))
+            momentum[i:end] = buf
+        momentum.flush()
+    del momentum
+
+
 def apply_round_aggregation(ready_pool_list: List[dict]):
     global global_weights, global_step
     if not ready_pool_list:
@@ -3251,6 +3331,15 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     engram_accumulator = {}
     row_lim = HARDEN["ENGRAM_ROW_NORM_MAX"]
     total_applied = 0; total_tokens = 0; clipped_count = 0; rejected_count = 0
+    diloco = _outer_enabled()
+    pseudo = None
+    pseudo_path = None
+    if diloco:
+        pseudo_path, _ = _outer_buffer_paths()
+        try: os.remove(pseudo_path)
+        except FileNotFoundError: pass
+        pseudo = np.memmap(str(pseudo_path), dtype=np.float32, mode="w+", shape=(MODEL_SIZE,))
+        log.info(f"🧮 DiLoCo outer optimizer: momentum={OUTER_CONFIG['MOMENTUM']}, nesterov={OUTER_CONFIG['NESTEROV']}")
     for pool_result in ready_pool_list:
         pool_id = pool_result["pool_id"]
         for path, weight in pool_result["deltas"]:
@@ -3294,8 +3383,13 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 scale = (cap / dnorm) if (dnorm > cap > 0) else 1.0
                 if scale < 1.0: clipped_count += 1
                 if weight > 0:
-                    # was: stream_add_base_delta(global_weights, df, lr * weight * scale)
-                    with shard_lock: stream_add_base_delta(global_weights, df, lr * pool_norm * weight * scale)
+                    coef = pool_norm * weight * scale
+                    if diloco:
+                        # Accumulate the weighted pseudogradient; the outer
+                        # optimizer (not per-round SGD) decides the step size.
+                        stream_add_base_delta(torch.from_numpy(pseudo), df, coef)
+                    else:
+                        with shard_lock: stream_add_base_delta(global_weights, df, lr * coef)
                     eng_idx, eng_val = read_engram_tail(df, MODEL_CONFIG["dim"])
                     if eng_idx is not None and len(eng_idx) > 0:
                         evf = eng_val.float()
@@ -3318,6 +3412,14 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 try: os.remove(path)
                 except Exception: pass
                 gc.collect()
+    if diloco and pseudo is not None:
+        try:
+            pseudo.flush()
+            _apply_outer_update(pseudo, lr)
+        finally:
+            del pseudo
+            try: os.remove(pseudo_path)
+            except OSError: pass
     with shard_lock:
         norm_sq = 0.0; cs = 10_000_000
         for i in range(0, MODEL_SIZE, cs):
@@ -3331,6 +3433,10 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 PUB.event("aggregation_reverted", step=step_before, norm_before=pre_norm, norm_after=norm, ratio=ratio)
                 log.error(f"🚨🚨 AGGREGATION SANITY FAIL: norm {pre_norm:.1f} → {norm:.1f} (ratio={ratio:.3f}). Reverting from disk, NOT advancing step.")
                 load_model_weights(); load_engram_weights()
+                if diloco:
+                    try: OUTER_MOMENTUM_FILE.unlink()
+                    except FileNotFoundError: pass
+                    log.warning("🧮 Reset outer momentum after reverted aggregation")
                 with stats_lock: global_step = step_before
                 for pool_result in ready_pool_list:
                     for path, _w in pool_result.get("deltas", []):

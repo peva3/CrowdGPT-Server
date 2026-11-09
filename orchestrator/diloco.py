@@ -7,11 +7,17 @@ from .compression import compress_delta, decompress_delta
 
 
 def outer_step(params, pseudograd, *, lr: float, momentum: float = 0.9,
-               nesterov: bool = True):
-    """One outer SGD step. ``params``/``pseudograd`` are flat float arrays."""
+               nesterov: bool = True, buffer=None):
+    """One outer SGD step with persistent momentum.
+
+    ``buffer`` is the previous momentum term (None means zero). Passing it back
+    on the next round is what makes this DiLoCo rather than per-round sign
+    descent; the caller must persist it across rounds.
+    """
     p = np.asarray(params, dtype=np.float32)
     g = np.asarray(pseudograd, dtype=np.float32)
-    buf = momentum * g
+    prev = np.zeros_like(g) if buffer is None else np.asarray(buffer, dtype=np.float32)
+    buf = momentum * prev + g
     update = g + momentum * buf if nesterov else buf
     return p - lr * update, buf
 

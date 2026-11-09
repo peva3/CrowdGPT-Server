@@ -41,8 +41,7 @@ separate and remains the authority for weights.
 
 ## What is not covered
 
-- No SBOM generator is wired yet; `pip list --format=freeze` is the current
-  inventory.
+- `tools/sbom.py` emits a CycloneDX-style inventory of installed distributions.
 - No reproducible-build check yet. Two builds are assumed equivalent if they
   use the same lock file and base image, which is weaker than bit-for-bit
   reproduction.

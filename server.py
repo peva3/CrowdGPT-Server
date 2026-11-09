@@ -171,6 +171,7 @@ tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swe
 try:
     from orchestrator import Orchestrator
     from orchestrator.objects import LocalObjectStore
+    from orchestrator.s3_objects import S3ObjectStore
     from orchestrator.nodes import NodeRegistry, local_node_record, node_id_for
     from orchestrator.cluster import ClusterView, LeaseManager
     from orchestrator.admission_policy import AdmissionPolicy
@@ -199,7 +200,9 @@ else:
     LocalObjectStore = LocalObjectStore
 ORCH = None
 OBJECT_STORE = None
+OBJECT_BACKEND = "none"
 PEER = None
+API_VERSION = "ng-api-2"
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
 ROUND_BYTES_START = {"requests": 0, "bytesIn": 0, "bytesOut": 0}
 NODE_ID = None
@@ -276,10 +279,17 @@ def _open_orchestrator():
                 secret_path.write_bytes(secret)
                 try: os.chmod(secret_path, 0o600)
                 except OSError: pass
-            OBJECT_STORE = LocalObjectStore(
-                obj_dir, secret=secret,
-                url_base=os.getenv("CROWDGPT_OBJECT_URL_BASE", "/fl/object"))
-            log.info(f"📦 Object store: {obj_dir} (presigned PUT)")
+            s3 = S3ObjectStore.from_env() if "S3ObjectStore" in globals() else None
+            if s3 is not None:
+                OBJECT_STORE = s3
+                OBJECT_BACKEND = "s3"
+                log.info(f"📦 Object store: s3://{s3.bucket}/{s3.prefix} (presigned PUT)")
+            else:
+                OBJECT_STORE = LocalObjectStore(
+                    obj_dir, secret=secret,
+                    url_base=os.getenv("CROWDGPT_OBJECT_URL_BASE", "/fl/object"))
+                OBJECT_BACKEND = "local"
+                log.info(f"📦 Object store: {obj_dir} (presigned PUT)")
         try:
             global NODE_ID
             reg = NodeRegistry(ORCH.store)
@@ -866,6 +876,7 @@ HARDEN = {
     "LOSS_TOLERANCE": _env_float("CROWDGPT_LOSS_TOLERANCE", 0.0),
     "LOSS_FAIL_OPEN": os.getenv("CROWDGPT_LOSS_FAIL_OPEN", "1") == "1",
     "LOSS_TIMEOUT_S": _env_int("CROWDGPT_LOSS_TIMEOUT_S", 1800),
+    "REQUIRE_EVAL": os.getenv("CROWDGPT_REQUIRE_EVAL", "0") == "1",
     "PUBLIC_URL": os.getenv("CROWDGPT_PUBLIC_URL", "https://server.crowdgpt.net").rstrip("/"),
 }
 if HARDEN["LOSS_CHECK_MODE"] not in ("off", "log", "enforce"): HARDEN["LOSS_CHECK_MODE"] = "off"
@@ -2030,6 +2041,12 @@ def _round_roots(rnd: int) -> tuple[str, str, str]:
                 for s in subs]
     return merkle_root(t_leaves), merkle_root(s_leaves), merkle_root(d_leaves)
 
+def _eval_configured() -> bool:
+    """True when a held-out evaluator can be reached for this round."""
+    if HARDEN["LOSS_CHECK_MODE"] != "off" and HARDEN["LOSS_CHECK_URL"]:
+        return True
+    return bool(os.getenv("CROWDGPT_EVAL_URL", "").strip())
+
 def _round_eval(held) -> Optional[dict]:
     """Held-out evaluation for a round, or None when nothing was evaluated.
 
@@ -2122,11 +2139,18 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
                                          "step": view.global_step}),
             leader=NODE_ID or "node-unknown", witnesses=(),
             tickets_root=tickets_root, submissions_root=submissions_root,
-            deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
+            deltas_root=deltas_root, prev_record_hash=prev,
+            eval=(_round_eval(held) or ({"status": "unevaluated", "required": True}
+                                       if HARDEN.get("REQUIRE_EVAL") else None)),
             bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
             bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
             code_versions=("3.2",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
+        if PEER is not None and PEER.config.peers:
+            try:
+                rec = PEER.collect_witnesses(rec, required=2)
+            except Exception as e:
+                log.warning(f"⚠️ witness collection failed: {e}")
         ORCH.publication.publish_round(rnd, rec)
         _write_nutrition(rec, rnd, rec.get("eval"))
         try:
@@ -3635,6 +3659,13 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                 try: os.remove(path)
                 except Exception: pass
         return
+    if HARDEN.get("REQUIRE_EVAL") and not _eval_configured():
+        log.error("❌ Skipping aggregation — held-out evaluation required but no evaluator is configured")
+        for pool_result in ready_pool_list:
+            for path, _weight in pool_result.get("deltas", []):
+                try: os.remove(path)
+                except Exception: pass
+        return
     with shard_lock:
         pre_norm_sq = 0.0; cs = 10_000_000
         for i in range(0, MODEL_SIZE, cs):
@@ -4194,8 +4225,17 @@ async def submit_finalize(request: Request):
         client_ip = get_client_ip(request)
         client_key = up.get("client_key") or get_client_key(request)
         up["status"] = "finalizing"; up["last_activity"] = time.time()
+        local_object = None
         try:
-            result = await run_in_threadpool(_guarded_process, str(OBJECT_STORE.path_for(str(object_key))),
+            if OBJECT_BACKEND == "s3":
+                local_object = WORK_TMP / f"object_{uuid.uuid4().hex}.bin"
+                try: OBJECT_STORE.download(str(object_key), local_object, expected_sha256=expected)
+                except ValueError as e:
+                    raise HTTPException(400, {"reason": str(e)})
+                delta_path = str(local_object)
+            else:
+                delta_path = str(OBJECT_STORE.path_for(str(object_key)))
+            result = await run_in_threadpool(_guarded_process, delta_path,
                                              client_ip, client_key, request, up["meta"])
             if ORCH is not None:
                 try: ORCH.submission.complete_upload(upload_id, result)
@@ -4207,6 +4247,9 @@ async def submit_finalize(request: Request):
             except Exception: pass
             return result
         finally:
+            if local_object is not None:
+                try: local_object.unlink()
+                except OSError: pass
             with uploads_lock:
                 current = _active_uploads.get(upload_id)
                 if current and current.get("status") == "finalizing":
@@ -4391,6 +4434,53 @@ async def admin_node_revoke(request: Request, secret: str = ""):
     if node is None: raise HTTPException(404, {"reason": "node_unknown"})
     rep = ReputationService(ORCH.store).slash(node, data.get("reason", "revoked"))
     return {"status": "revoked", "reputation": rep.__dict__}
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text exposition. Aggregate counters only: no identities."""
+    rounds = ORCH.audit.rounds() if ORCH is not None else []
+    certified = sum(1 for item in rounds if (item.get("record") or {}).get("certificate"))
+    lines = [
+        "# HELP crowdgpt_round_current Current round number",
+        "# TYPE crowdgpt_round_current gauge",
+        f"crowdgpt_round_current {int(round_state['current_round'])}",
+        "# HELP crowdgpt_global_step Current global step",
+        "# TYPE crowdgpt_global_step gauge",
+        f"crowdgpt_global_step {int(global_step)}",
+        "# HELP crowdgpt_tokens_total Reported training tokens",
+        "# TYPE crowdgpt_tokens_total counter",
+        f"crowdgpt_tokens_total {int(global_stats.get('totalTokens', 0))}",
+        "# HELP crowdgpt_control_plane_requests_total Control-plane requests",
+        "# TYPE crowdgpt_control_plane_requests_total counter",
+        f"crowdgpt_control_plane_requests_total {int(CONTROL_PLANE['requests'])}",
+        "# HELP crowdgpt_control_plane_bytes_in_total Control-plane request bytes",
+        "# TYPE crowdgpt_control_plane_bytes_in_total counter",
+        f"crowdgpt_control_plane_bytes_in_total {int(CONTROL_PLANE['bytesIn'])}",
+        "# HELP crowdgpt_control_plane_bytes_out_total Control-plane response bytes",
+        "# TYPE crowdgpt_control_plane_bytes_out_total counter",
+        f"crowdgpt_control_plane_bytes_out_total {int(CONTROL_PLANE['bytesOut'])}",
+        "# HELP crowdgpt_rounds_published_total Published round records",
+        "# TYPE crowdgpt_rounds_published_total counter",
+        f"crowdgpt_rounds_published_total {len(rounds)}",
+        "# HELP crowdgpt_rounds_certified_total Published rounds with a certificate",
+        "# TYPE crowdgpt_rounds_certified_total counter",
+        f"crowdgpt_rounds_certified_total {certified}",
+        "",
+    ]
+    return Response("\n".join(lines), media_type="text/plain; version=0.0.4")
+
+@app.get("/api/version")
+async def api_version():
+    return {"app": "crowdgpt-orchestrator", "api": API_VERSION,
+            "protocol": "ng-1", "ticket": "ng-ticket-1",
+            "stateSchema": ORCH.store.schema_version() if ORCH is not None else None,
+            "minClientVersion": _min_client_version or None,
+            "objectBackend": OBJECT_BACKEND,
+            "features": {"peerReplication": PEER is not None,
+                         "presignedObjects": OBJECT_BACKEND != "none",
+                         "heldOutEval": _eval_configured(),
+                         "evalRequired": bool(HARDEN.get("REQUIRE_EVAL")),
+                         "lora": True, "ngd1": True, "diloco": bool(_outer_enabled())}}
 
 @app.get("/cluster/health")
 async def cluster_health():

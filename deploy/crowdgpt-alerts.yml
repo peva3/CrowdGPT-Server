@@ -1,0 +1,34 @@
+# Prometheus alert rules for a CrowdGPT orchestrator.
+groups:
+  - name: crowdgpt-orchestrator
+    rules:
+      - alert: CrowdGPTDown
+        expr: up{job="crowdgpt-orchestrator"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Orchestrator is not scrapeable"
+      - alert: CrowdGPTNoRounds
+        expr: increase(crowdgpt_rounds_published_total[6h]) == 0
+        for: 6h
+        labels: {severity: warning}
+        annotations:
+          summary: "No signed round has been published in 6 hours"
+      - alert: CrowdGPTCertificationGap
+        expr: crowdgpt_rounds_published_total - crowdgpt_rounds_certified_total > 2
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "More than two published rounds lack a certificate"
+      - alert: CrowdGPTControlPlaneGrowth
+        expr: rate(crowdgpt_control_plane_bytes_in_total[15m]) > 5e7
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Control-plane ingress above 50 MB/s"
+      - alert: CrowdGPTStaleTickets
+        expr: crowdgpt_round_current - crowdgpt_global_step > 3
+        for: 2h
+        labels: {severity: warning}
+        annotations:
+          summary: "Round number is far ahead of the global step"

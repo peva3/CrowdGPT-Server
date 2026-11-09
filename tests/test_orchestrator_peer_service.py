@@ -34,6 +34,8 @@ class RoutedTransport(HttpTransport):
             return {"ack": True, "node": peer.config.node_id,
                     "pubkey": peer.identity.public_key_hex,
                     "sig": peer.identity.sign(canonical_json(lease).encode())}
+        if path == "/cluster/witness/sign":
+            return peer.witness_sign(body["record"])
         if path == "/cluster/registry/announce":
             node = peer.accept_registry(body["record"], body["signature"])
             return {"ok": node is not None}
@@ -129,4 +131,62 @@ def test_registry_announcement_reaches_peer(tmp_path):
                                started_at="2026-11-09T00:00:00Z")
     assert a.publish_self(record) is True
     assert a.config.node_id in [n.record["node_id"] for n in b.registry.active()]
+    a_store.close(); b_store.close()
+
+
+class DownTransport(HttpTransport):
+    def post(self, endpoint, path, body):
+        return None
+
+
+def test_outbox_retains_failed_announcement_and_drains_later(tmp_path):
+    a_id = NodeIdentity.generate()
+    b_id = NodeIdentity.generate()
+    a_store = StateStore(tmp_path / "a.sqlite3")
+    b_store = StateStore(tmp_path / "b.sqlite3")
+    a_node, b_node = node_id_for(a_id), node_id_for(b_id)
+    b_peer = Peer(b_node, "http://b.test", b_id.public_key_hex)
+    b = PeerService(b_store, b_id, PeerConfig(b_node, "http://b.test", ()))
+    a = PeerService(a_store, a_id, PeerConfig(a_node, "http://a.test", (b_peer,),
+                                              quorum=1), transport=DownTransport())
+    ticket = a.admission.issue("ip:a", "t1", 1)
+    assert a.announce_ticket(ticket, {"taskId": "t1", "round": 1}) == 0
+    assert a.outbox_pending() == 1
+    a.transport = RoutedTransport({"http://b.test": b})
+    result = a.drain(now=time.time() + 10)
+    assert result == {"delivered": 1, "retried": 0}
+    assert a.outbox_pending() == 0
+    assert b.admission.get("ip:a").ticket_id == ticket.ticket_id
+    a_store.close(); b_store.close()
+
+
+def test_round_conflict_is_deterministic_and_closed_wins(tmp_path):
+    a, b, a_store, b_store = _pair(tmp_path)
+    assert b.accept_round(a.auth.wrap({"round": {"round": 9, "state": "open", "x": "z"}}))["ok"]
+    # A lexicographically smaller open snapshot wins; a larger one is refused.
+    assert b.accept_round(a.auth.wrap({"round": {"round": 9, "state": "open", "x": "a"}}))["ok"]
+    assert b.accept_round(a.auth.wrap({"round": {"round": 9, "state": "open", "x": "zz"}}))["reason"] == "round_conflict"
+    # A closed round is terminal and cannot be reopened.
+    assert b.accept_round(a.auth.wrap({"round": {"round": 9, "state": "closed", "x": "a"}}))["ok"]
+    assert b.accept_round(a.auth.wrap({"round": {"round": 9, "state": "open", "x": "b"}}))["reason"] == "round_conflict"
+    a_store.close(); b_store.close()
+
+
+def test_witness_quorum_is_collected_and_bad_peer_ignored(tmp_path):
+    a, b, a_store, b_store = _pair(tmp_path)
+    record = {"schema": "ng-1", "round": 4, "leader": a.config.node_id,
+              "certificate": [{"node": a.config.node_id,
+                               "pubkey": a.identity.public_key_hex,
+                               "sig": a.identity.sign(canonical_json({"round": 4}).encode())}]}
+    # The fake leader signature above cannot verify, so a real signed record is built below.
+    from orchestrator.records import build_round_record, sign_record, verify_certificate
+    rec = build_round_record(round_no=4, opened_at="a", closed_at="b",
+        base_weights="a" * 64, aggregate_weights="b" * 64, leader=a.config.node_id,
+        witnesses=(), tickets_root="1" * 64, submissions_root="2" * 64,
+        deltas_root="3" * 64, prev_record_hash=None, eval=None,
+        bytes_down=1, bytes_up=2, code_versions=("3.2",))
+    rec = sign_record(rec, a.identity, a.config.node_id)
+    out = a.collect_witnesses(rec, required=1)
+    assert len(out["certificate"]) == 2
+    assert all(verify_certificate(out, c) for c in out["certificate"])
     a_store.close(); b_store.close()

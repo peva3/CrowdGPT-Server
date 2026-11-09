@@ -16,8 +16,10 @@ from typing import Optional
 from .admission import AdmissionService
 from .domain import TicketView
 from .identity import NodeIdentity
+from .outbox import Outbox
 from .records import (canonical_json, sign_record, signing_payload,
                       verify_certificate)
+from .cluster import certify
 from .replication import (HttpTransport, Peer, PeerConfig, ReplicatedLease,
                           ReplicatedRegistry)
 from .state import StateStore
@@ -58,7 +60,8 @@ class PeerAuth:
 class PeerService:
     def __init__(self, store: StateStore, identity: NodeIdentity, config: PeerConfig,
                  *, transport: Optional[HttpTransport] = None,
-                 admission: Optional[AdmissionService] = None):
+                 admission: Optional[AdmissionService] = None,
+                 outbox: Optional[Outbox] = None):
         self.store = store
         self.identity = identity
         self.config = config
@@ -71,6 +74,24 @@ class PeerService:
                                            transport=self.transport,
                                            path_prefix="/cluster", envelope=True)
         self.admission = admission or AdmissionService(store, identity=identity)
+        self.outbox = outbox or Outbox(store)
+
+    def _announce(self, path: str, body: dict) -> int:
+        """Persist one row per peer, then try to drain immediately."""
+        for peer in self.config.peers:
+            self.outbox.enqueue("peer-announce", {
+                "endpoint": peer.endpoint, "path": path,
+                "body": self.auth.wrap(body)})
+        result = self.drain()
+        return int(result.get("delivered", 0))
+
+    def drain(self, *, now=None) -> dict:
+        def send(kind: str, payload: dict) -> bool:
+            return bool(self.transport.post(payload["endpoint"], payload["path"], payload["body"]))
+        return self.outbox.drain(send, now=now)
+
+    def outbox_pending(self) -> int:
+        return self.outbox.pending()
 
     # ---- health ---------------------------------------------------------
     def health(self) -> dict:
@@ -99,12 +120,8 @@ class PeerService:
 
     # ---- tickets and tasks ---------------------------------------------
     def announce_ticket(self, ticket: TicketView, task: Optional[dict] = None) -> int:
-        body = self.auth.wrap({"ticket": asdict(ticket), "task": task or {}})
-        sent = 0
-        for peer in self.config.peers:
-            if self.transport.post(peer.endpoint, "/cluster/ticket/announce", body):
-                sent += 1
-        return sent
+        return self._announce("/cluster/ticket/announce",
+                              {"ticket": asdict(ticket), "task": task or {}})
 
     def accept_ticket(self, body: dict) -> dict:
         if not self.auth.check(body):
@@ -140,12 +157,7 @@ class PeerService:
 
     # ---- rounds ---------------------------------------------------------
     def announce_round(self, snapshot: dict) -> int:
-        body = self.auth.wrap({"round": snapshot})
-        sent = 0
-        for peer in self.config.peers:
-            if self.transport.post(peer.endpoint, "/cluster/round/announce", body):
-                sent += 1
-        return sent
+        return self._announce("/cluster/round/announce", {"round": snapshot})
 
     def accept_round(self, body: dict) -> dict:
         if not self.auth.check(body):
@@ -154,13 +166,28 @@ class PeerService:
         round_no = snapshot.get("round")
         if round_no is None:
             return {"ok": False, "reason": "round_invalid"}
+        state = str(snapshot.get("state") or "open")
+        encoded = canonical_json(snapshot)
+        row = self.store.query_one("SELECT state,payload FROM peer_rounds WHERE round=?",
+                                   (int(round_no),))
+        if row:
+            current_state, current_payload = row["state"], row["payload"]
+            if current_state != state:
+                # A closed round is terminal.  Never reopen it from a stale peer.
+                if current_state == "closed":
+                    return {"ok": False, "reason": "round_conflict"}
+                if state != "closed":
+                    return {"ok": False, "reason": "round_conflict"}
+            elif current_payload != encoded and encoded > current_payload:
+                # Deterministic tie-break: the lexicographically smaller snapshot
+                # wins, so two nodes converge whichever order they receive.
+                return {"ok": False, "reason": "round_conflict"}
         with self.store.transaction() as conn:
             conn.execute(
                 "INSERT INTO peer_rounds(round,state,payload,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(round) DO UPDATE SET state=excluded.state,"
                 "payload=excluded.payload,updated_at=excluded.updated_at",
-                (int(round_no), str(snapshot.get("state") or "open"),
-                 canonical_json(snapshot), time.time()))
+                (int(round_no), state, encoded, time.time()))
         return {"ok": True, "round": int(round_no)}
 
     def load_round(self, round_no: int) -> Optional[dict]:
@@ -170,14 +197,9 @@ class PeerService:
     # ---- submissions ----------------------------------------------------
     def announce_submission(self, content_sha256: str, round_no: int,
                             client_key: str) -> int:
-        body = self.auth.wrap({"contentSha256": content_sha256,
-                               "round": int(round_no),
-                               "clientKey": client_key})
-        sent = 0
-        for peer in self.config.peers:
-            if self.transport.post(peer.endpoint, "/cluster/submission/announce", body):
-                sent += 1
-        return sent
+        return self._announce("/cluster/submission/announce",
+                              {"contentSha256": content_sha256,
+                               "round": int(round_no), "clientKey": client_key})
 
     def accept_submission(self, body: dict) -> dict:
         if not self.auth.check(body):
@@ -203,6 +225,39 @@ class PeerService:
 
     def verify_peer_record(self, record: dict, cert: dict) -> bool:
         return verify_certificate(record, cert)
+
+    def collect_witnesses(self, record: dict, *, required: int = 2) -> dict:
+        """Ask peers to co-sign a leader-signed record and attach a quorum.
+
+        A failed or non-quorum collection leaves the record with only its
+        leader certificate; the publication path then reports it uncertified.
+        """
+        certs = list(record.get("certificate") or [])
+        allowed = {c.get("node"): c.get("pubkey") for c in certs
+                   if c.get("node") and c.get("pubkey")}
+        for peer in self.config.peers:
+            try:
+                reply = self.transport.post(
+                    peer.endpoint, "/cluster/witness/sign",
+                    self.auth.wrap({"record": record}))
+            except Exception:
+                continue
+            if not isinstance(reply, dict):
+                continue
+            node = reply.get("node")
+            pubkey = reply.get("pubkey")
+            if not node or not pubkey or not reply.get("sig"):
+                continue
+            cert = {"node": node, "pubkey": pubkey, "sig": reply["sig"]}
+            if self.verify_peer_record(record, cert):
+                certs.append(cert)
+                allowed[node] = pubkey
+        try:
+            body = certify(record, certs, required=int(required), allowed=allowed or None)
+        except ValueError:
+            body = dict(record)
+            body["certificate"] = certs
+        return body
 
 
 __all__ = ["PeerAuth", "PeerService"]

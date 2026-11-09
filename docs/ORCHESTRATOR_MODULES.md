@@ -126,3 +126,27 @@ Evidence: `pytest tests -q` → 10 passed, including token scope/expiry and hash
 mismatch. `pytest tests/test_ng_server_harness.py -q` → 7 passed, including a
 presigned PUT that does not increment control-plane requests, bad/expired grant
 rejection, and a tampered object rejected at finalize.
+
+## P6.0/P6.6 — cross-node replication
+
+`orchestrator/replication.py` adds the smallest transport that makes the quorum
+rules real across processes:
+
+- `ReplicatedLease.acquire()` writes the lease locally, asks every static peer
+  to `/sim/lease/ack`, verifies each peer's signature over the same
+  `(schema, round, leader, term, expiresAt)` payload, and keeps the lease only
+  at a majority (`(peers+1)//2 + 1`, or an explicit quorum). A conflicting live
+  lease is rejected by the peer.
+- `ReplicatedRegistry.publish()` registers a signed `NodeRecord` locally and
+  announces it; peers verify the record signature before storing it.
+- Submission finalize announces accepted content hashes so a retry to another
+  node is idempotent by content hash.
+
+`tools/sim_node.py` is a control-plane-only orchestrator process for drills;
+`tools/sim_cluster.py` launches 3 nodes (and a 4-node partition group) and
+records the results in `Crowdgpt-ng/docs/NG_DRILLS.md`. These drills are
+single-machine simulations, not a production RTO.
+
+`tests/test_orchestrator_replication.py` → 5 passed: majority acknowledgement,
+lease release without quorum, conflicting-lease rejection, signed registry
+announce, bad-signature rejection.

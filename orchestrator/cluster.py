@@ -79,6 +79,18 @@ class LeaseManager:
                 (int(round_no), node_id, int(term), now + self.ttl_s, now))
         return Lease(int(round_no), node_id, int(term), now + self.ttl_s)
 
+    def adopt(self, lease: Lease, at: Optional[float] = None) -> Lease:
+        """Store a leader's lease locally (used by a peer that acknowledged it)."""
+        now = time.time() if at is None else at
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO leases(round,leader,term,expires_at,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(round) DO UPDATE SET leader=excluded.leader, term=excluded.term, "
+                "expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+                (int(lease.round), lease.leader, int(lease.term),
+                 float(lease.expires_at), now))
+        return lease
+
     def current(self, round_no: int, at: Optional[float] = None) -> Optional[Lease]:
         now = time.time() if at is None else at
         row = self.store.query_one("SELECT * FROM leases WHERE round=?", (int(round_no),))

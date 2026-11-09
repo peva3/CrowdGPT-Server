@@ -169,6 +169,8 @@ CREATE TABLE IF NOT EXISTS leases (
     leader TEXT NOT NULL,
     term INTEGER NOT NULL,
     expires_at REAL NOT NULL,
+    quorum INTEGER NOT NULL DEFAULT 1,
+    acks TEXT NOT NULL DEFAULT '[]',
     updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -215,6 +217,7 @@ class StateStore:
             "tickets": {"base_weights": "TEXT", "signature": "TEXT", "public_key": "TEXT"},
             "uploads": {"result": "TEXT"},
             "nodes": {"record_sig": "TEXT"},
+            "leases": {"quorum": "INTEGER NOT NULL DEFAULT 1", "acks": "TEXT NOT NULL DEFAULT '[]'"},
         }
         for table, columns in wanted.items():
             have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}

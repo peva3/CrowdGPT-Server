@@ -9,8 +9,11 @@ Date: 2026-11-09.
   `docs/NG_BASE.md`.
 - Server base: `Vxtzq/CrowdGPT-Server` at
   `34f190bb722e2de55de7473b5f34f862c806cad6`.
-- The server has no writable public fork yet; server commits are local and
-  must be published before an external pilot.
+- Server fork: `https://github.com/peva3/CrowdGPT-Server`, branch `main`,
+  created 2026-11-09 and fast-forwarded from base
+  `34f190bb722e2de55de7473b5f34f862c806cad6` to commit `f8e445e`.
+  `origin` in the local checkout still points at `Vxtzq/CrowdGPT-Server`;
+  `fork` points at `peva3/CrowdGPT-Server`.
 
 ## Runtime pins
 

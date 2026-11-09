@@ -166,6 +166,7 @@ try:
     from orchestrator import lora as lora_wire
     from orchestrator import diloco as diloco_opt
     from orchestrator.adversarial import plausible_loss
+    from orchestrator.metrics import MetricsRecorder, RoundMetric
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     diloco_opt = None
@@ -1915,6 +1916,30 @@ def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools:
             code_versions=("3.2",))
         rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
         ORCH.publication.publish_round(rnd, rec)
+        try:
+            subs = ORCH.submission.load_submissions(round_no=rnd)
+            ids = {s.submission_id for s in subs}
+            rejected = sum(1 for v in ORCH.verification.all()
+                           if v.submission_id in ids and v.verdict == "rejected")
+            receipts = ORCH.receipts.all(rnd)
+            versions = sorted({str((r.get("payload") or {}).get("code_version") or "")
+                               for r in receipts} - {""})
+            gpus = sorted({str(hw.get("gpu") or "") for hw in client_hardware.values()} - {""})
+            ev = rec.get("eval") or {}
+            MetricsRecorder(DATA_DIR / "round_metrics.jsonl").append(RoundMetric(
+                schema="ng-metric-1", round=rnd, step=int(view.global_step),
+                opened_at=opened, closed_at=closed,
+                duration_s=round(time.time() - float(view.started_at), 3),
+                tokens=sum(int(s.tokens) for s in subs),
+                deltas=int(len(subs)), accepted=int(len(subs)), rejected=int(rejected),
+                bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
+                bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
+                eval_loss=ev.get("loss"), eval_n=ev.get("windows"),
+                client_versions=tuple(versions), gpu_classes=tuple(gpus[:8]),
+                certified=len(rec.get("certificate") or []) >= 2,
+            ))
+        except Exception as exc:
+            log.warning(f"⚠️ round metric write failed: {exc}")
         mirror = os.getenv("CROWDGPT_AUDIT_MIRROR", "").strip()
         if mirror:
             try:

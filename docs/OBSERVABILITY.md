@@ -15,6 +15,10 @@ Date: 2026-11-09.
    held-out eval, client versions, GPU classes, and certification.
 4. **Append-only.** The metrics file is JSONL; never rewrite a row. A corrected
    value is a new row with a later timestamp.
+5. **Wired at round close.** `_publish_round_record()` appends one
+   `RoundMetric` to `data/round_metrics.jsonl` after publishing the signed
+   record. `certified` stays false until witness quorum is assembled; the
+   leader signature alone is not counted.
 
 ## Round record fields
 

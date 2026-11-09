@@ -29,7 +29,7 @@ def merkle_root(leaves: Iterable[str]) -> str:
     nodes = sorted(str(x).lower() for x in leaves)
     if not nodes:
         return hashlib.sha256(b"").hexdigest()
-    level = [hashlib.sha256(x.encode("utf-8")).hexdigest() for x in nodes]
+    level = list(nodes)
     while len(level) > 1:
         if len(level) % 2: level.append(level[-1])
         level = [hashlib.sha256(bytes.fromhex(level[i] + level[i + 1])).hexdigest()
@@ -41,7 +41,7 @@ def merkle_proof(leaves: Iterable[str], index: int) -> list[dict]:
     nodes = sorted(str(x).lower() for x in leaves)
     if not nodes: raise ValueError("empty tree")
     if not 0 <= index < len(nodes): raise ValueError("index out of range")
-    level = [hashlib.sha256(x.encode("utf-8")).hexdigest() for x in nodes]
+    level = list(nodes)
     pos = index
     proof = []
     while len(level) > 1:
@@ -56,7 +56,7 @@ def merkle_proof(leaves: Iterable[str], index: int) -> list[dict]:
 
 
 def verify_merkle_proof(leaf: str, proof: Sequence[dict], root: str) -> bool:
-    cur = hashlib.sha256(str(leaf).lower().encode("utf-8")).hexdigest()
+    cur = str(leaf).lower()
     for step in proof:
         h = step["hash"]
         cur = (hashlib.sha256(bytes.fromhex(cur + h)).hexdigest()

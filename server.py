@@ -103,9 +103,23 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTM
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import ipaddress
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    _HAS_SLOWAPI = True
+except ImportError:  # the limiter is optional; the coordinator still serves
+    _HAS_SLOWAPI = False
+    class RateLimitExceeded(Exception):
+        pass
+    class Limiter:
+        def __init__(self, *args, **kwargs): pass
+        def limit(self, *args, **kwargs):
+            return lambda fn: fn
+    def _rate_limit_exceeded_handler(*args, **kwargs):
+        return None
+    def get_remote_address(request):
+        return request.client.host if request.client else "unknown"
 
 try:
     import psutil
@@ -133,7 +147,7 @@ from krum_stream import plan_round, stream_add_base_delta, read_engram_tail, ope
 from public_log import PUB   # public event log + loss history
 
 # ============ CONFIGURATION ============
-PORT = 5006
+PORT = int(os.getenv("CROWDGPT_PORT", "5006"))
 BASE_DIR = Path(__file__).parent
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 DATA_DIR = BASE_DIR / "data"
@@ -161,26 +175,85 @@ try:
     from orchestrator.cluster import ClusterView, LeaseManager
     from orchestrator.admission_policy import AdmissionPolicy
     from orchestrator.reputation import ReputationService
-    from orchestrator.records import (build_round_record, digest_of, merkle_root,
-                                      record_hash, sign_record)
+    from orchestrator.records import (build_round_record, canonical_json, digest_of,
+                                      merkle_root, record_hash, sign_record,
+                                      verify_certificate)
     from orchestrator import lora as lora_wire
     from orchestrator import diloco as diloco_opt
     from orchestrator.adversarial import plausible_loss
     from orchestrator.metrics import MetricsRecorder, RoundMetric
     from orchestrator.compression import iter_frames
+    from orchestrator.peer_service import PeerService
+    from orchestrator.replication import HttpTransport, Peer, PeerConfig
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     diloco_opt = None
+    PeerService = None
+    HttpTransport = None
+    Peer = None
+    PeerConfig = None
     _ORCH_IMPORT_ERROR = _orch_import_err
 else:
     _ORCH_IMPORT_ERROR = None
     LocalObjectStore = LocalObjectStore
 ORCH = None
 OBJECT_STORE = None
+PEER = None
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
 ROUND_BYTES_START = {"requests": 0, "bytesIn": 0, "bytesOut": 0}
 NODE_ID = None
 ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
+
+def _peer_specs() -> list[dict]:
+    raw = (os.getenv("CROWDGPT_PEERS") or "").strip()
+    path = (os.getenv("CROWDGPT_PEERS_FILE") or "").strip()
+    if path:
+        raw = Path(path).read_text(encoding="utf-8")
+    if not raw:
+        return []
+    if raw.startswith("[") or raw.startswith("{"):
+        data = json.loads(raw)
+    else:
+        data = json.loads(Path(raw).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("peers") or []
+    if not isinstance(data, list):
+        raise ValueError("peer config must be a JSON list")
+    return [p for p in data if isinstance(p, dict) and p.get("node_id")
+            and p.get("endpoint") and p.get("pubkey")]
+
+def _peer_quorum() -> Optional[int]:
+    raw = (os.getenv("CROWDGPT_PEER_QUORUM") or "").strip()
+    if not raw:
+        return None
+    try: return max(1, int(raw))
+    except ValueError: return None
+
+def _open_peer(record: dict) -> None:
+    global PEER
+    if PeerService is None:
+        return
+    try:
+        specs = _peer_specs()
+        if not specs:
+            return
+        endpoint = os.getenv("CROWDGPT_PUBLIC_URL", f"http://localhost:{PORT}").rstrip("/")
+        peers = tuple(Peer(p["node_id"], p["endpoint"].rstrip("/"), p["pubkey"])
+                      for p in specs if p["node_id"] != NODE_ID)
+        cfg = PeerConfig(NODE_ID or "", endpoint, peers, _peer_quorum())
+        transport = HttpTransport(
+            timeout_s=float(os.getenv("CROWDGPT_PEER_TIMEOUT_S", "2.0")),
+            tls_verify=(os.getenv("CROWDGPT_PEER_TLS_VERIFY", "1") != "0"),
+            ca_file=os.getenv("CROWDGPT_PEER_CA_FILE") or None)
+        PEER = PeerService(ORCH.store, ORCH.identity, cfg, transport=transport,
+                           admission=ORCH.admission)
+        log.info(f"🕸️ Peer replication: {len(peers)} peer(s), quorum={cfg.required}, "
+                 f"endpoint={endpoint}")
+        try: PEER.publish_self(record)
+        except Exception as e: log.warning(f"⚠️ peer self-registration failed: {e}")
+    except Exception as e:
+        log.warning(f"⚠️ peer replication disabled: {e}")
+        PEER = None
 
 def _open_orchestrator():
     global ORCH, OBJECT_STORE
@@ -216,6 +289,7 @@ def _open_orchestrator():
             reg.register(rec)
             NODE_ID = rec["node_id"]
             log.info(f"🪪 Node identity: {NODE_ID}")
+            _open_peer(rec)
         except Exception as e:
             log.warning(f"⚠️ node registration failed: {e}")
         return ORCH
@@ -422,6 +496,16 @@ def _persist_round_state(state: str = "open"):
                 global_step=global_step,
                 participating=dict(round_state.get("participating_clients", {})),
             )
+            snapshot = {
+                "round": round_state["current_round"], "state": state,
+                "startedAt": round_state["round_start_time"],
+                "durationHours": round_state["round_duration_hours"],
+                "globalStep": global_step,
+                "forceEndAt": round_state.get("force_end_at"),
+                "participating": dict(round_state.get("participating_clients", {})),
+            }
+        if PEER is not None:
+            threading.Thread(target=PEER.announce_round, args=(snapshot,), daemon=True).start()
     except Exception as e:
         log.warning(f"⚠️ round state persist failed: {e}")
 
@@ -468,6 +552,39 @@ def _persist_pool_removed(pool_id: str):
     try: ORCH.scheduling.remove_pool(pool_id)
     except Exception as e: log.warning(f"⚠️ pool removal persist failed: {e}")
 
+def _ensure_peer_task(task_id: str, client_key: Optional[str] = None) -> Optional[dict]:
+    """Load a replicated task and a minimal replica pool for a peer-issued ticket."""
+    if task_id in db["tasks"]:
+        return db["tasks"][task_id]
+    if PEER is None:
+        return None
+    task = PEER.load_task(task_id)
+    if not task:
+        return None
+    db["tasks"][task_id] = dict(task)
+    pool_id = task.get("poolId") or task.get("pool_id")
+    if pool_id and pool_id not in pools:
+        snap = dict(task.get("poolSnapshot") or {})
+        clients = list(snap.get("clients") or ([client_key] if client_key else []))
+        if not clients:
+            clients = [f"remote:{task_id}"]
+        snap.update({
+            "pool_id": pool_id,
+            "task_id": task_id,
+            "clients": clients,
+            "hardware_sig": tuple(snap.get("hardware_sig") or ()),
+            "status": "training",
+            "deltas": {},
+            "round": int(snap.get("round") or task.get("round") or round_state["current_round"]),
+            "replica": True,
+            "created_at": float(snap.get("created_at") or time.time()),
+            "activated_at": float(snap.get("activated_at") or time.time()),
+        })
+        pools[pool_id] = snap
+        for c in clients:
+            client_pool_map[c] = pool_id
+    return db["tasks"][task_id]
+
 def _persist_ticket(client_key: str, task_id: str, pool: Optional[dict] = None):
     if ORCH is None: return None
     try:
@@ -483,6 +600,21 @@ def _persist_ticket(client_key: str, task_id: str, pool: Optional[dict] = None):
             t["ticketId"] = ticket.ticket_id
             t["signature"] = ticket.signature
             t["publicKey"] = ticket.public_key
+        if PEER is not None:
+            task = dict(db["tasks"].get(task_id) or {})
+            task["round"] = ticket.round
+            task["clientKey"] = client_key
+            if pool:
+                task["poolSnapshot"] = {
+                    k: pool.get(k) for k in (
+                        "pool_id", "round", "clients", "hardware_sig", "status",
+                        "created_at", "activated_at", "chunk_idx", "target_seed",
+                        "target_autocast", "target_optimizer", "target_steps")
+                }
+            def _announce():
+                try: PEER.announce_ticket(ticket, task)
+                except Exception as e: log.warning(f"⚠️ ticket announce failed: {e}")
+            threading.Thread(target=_announce, daemon=True).start()
         return ticket
     except Exception as e:
         log.warning(f"⚠️ ticket persist failed: {e}")
@@ -578,6 +710,10 @@ def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict
             loss_reported=None if loss is None else f"{float(loss):.6f}",
             user_uuid=user_uuid,
         )
+        if PEER is not None:
+            threading.Thread(target=PEER.announce_submission,
+                             args=(key, round_state["current_round"], client_key),
+                             daemon=True).start()
     except Exception as e:
         log.warning(f"⚠️ submission persist failed: {e}")
 
@@ -2994,7 +3130,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     engram_values = (_ev32 * torch.clamp(_lim / _rn.clamp_min(1e-12), max=1.0).unsqueeze(1)).to(torch.bfloat16).contiguous()
                 del _ev32, _rn
             task_id = body.get("taskId")
-            task_meta = db["tasks"].get(task_id)
+            task_meta = db["tasks"].get(task_id) or _ensure_peer_task(task_id, client_key)
             if task_meta is None: raise HTTPException(status_code=404, detail="Task expired")
             _expected_mode = str(task_meta.get("trainMode") or "dense").lower()
             if is_lora != (_expected_mode == "lora"):
@@ -3902,6 +4038,8 @@ async def submit_init(request: Request):
     for k in required:
         if k not in data: raise HTTPException(status_code=400, detail=f"Missing field: {k}")
     task_id = str(data["taskId"])
+    if task_id not in db["tasks"]:
+        _ensure_peer_task(task_id, client_key)
     if task_id not in db["tasks"]: raise HTTPException(status_code=404, detail="Task expired")
     _tr = _ticket_rejection(client_key, task_id=task_id, ticket_id=data.get("ticketId"))
     if _tr in ("ticket_expired", "ticket_mismatch", "ticket_task_mismatch",
@@ -4253,6 +4391,106 @@ async def admin_node_revoke(request: Request, secret: str = ""):
     rep = ReputationService(ORCH.store).slash(node, data.get("reason", "revoked"))
     return {"status": "revoked", "reputation": rep.__dict__}
 
+@app.get("/cluster/health")
+async def cluster_health():
+    if PEER is None:
+        return {"ok": True, "node": NODE_ID, "peers": [], "quorum": 1,
+                "configured": False}
+    return {**PEER.health(), "configured": True}
+
+@app.post("/cluster/lease/ack")
+async def cluster_lease_ack(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    body = await request.json()
+    if not PEER.auth.check(body):
+        raise HTTPException(403, {"reason": "stale_or_replayed"})
+    lease = body.get("lease") or {}
+    if not PEER.adopt_lease({**lease, "signature": body.get("signature", "")},
+                            body.get("pubkey", "")):
+        raise HTTPException(409, {"reason": "lease_conflict_or_bad_signature"})
+    payload = {k: lease[k] for k in ("schema", "round", "leader", "term", "expiresAt")
+               if k in lease}
+    return {"ack": True, "node": PEER.config.node_id,
+            "pubkey": PEER.identity.public_key_hex,
+            "sig": PEER.identity.sign(canonical_json(payload).encode("utf-8"))}
+
+@app.get("/cluster/lease/current")
+async def cluster_lease_current(round: int | None = None):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    lease = PEER.current_lease(round or round_state["current_round"])
+    return {"lease": None if lease is None else {
+        "round": lease.round, "leader": lease.leader, "term": lease.term,
+        "expiresAt": lease.expires_at}}
+
+@app.post("/cluster/registry/announce")
+async def cluster_registry_announce(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    body = await request.json()
+    if not PEER.auth.check(body):
+        raise HTTPException(403, {"reason": "stale_or_replayed"})
+    node = PEER.accept_registry(body.get("record") or {}, body.get("signature") or "")
+    if node is None: raise HTTPException(400, {"reason": "node_signature_invalid"})
+    return {"ok": True, "node": node.record.get("node_id")}
+
+@app.get("/cluster/registry")
+async def cluster_registry():
+    if ORCH is None: return {"nodes": []}
+    return {"nodes": [n.record for n in NodeRegistry(ORCH.store).active(signed_only=True)]}
+
+@app.post("/cluster/ticket/announce")
+async def cluster_ticket_announce(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    return PEER.accept_ticket(await request.json())
+
+@app.post("/cluster/round/announce")
+async def cluster_round_announce(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    return PEER.accept_round(await request.json())
+
+@app.post("/cluster/submission/announce")
+async def cluster_submission_announce(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    return PEER.accept_submission(await request.json())
+
+@app.post("/cluster/witness/sign")
+async def cluster_witness_sign(request: Request):
+    if PEER is None: raise HTTPException(503, {"reason": "peer_disabled"})
+    body = await request.json()
+    if not PEER.auth.check(body):
+        raise HTTPException(403, {"reason": "stale_or_replayed"})
+    record = body.get("record") or {}
+    certs = record.get("certificate") or []
+    if not certs or not verify_certificate(record, certs[0]):
+        raise HTTPException(400, {"reason": "leader_certificate_invalid"})
+    return PEER.witness_sign(record)
+
+@app.get("/operator")
+async def operator_page():
+    return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8">
+<title>CrowdGPT operator</title><style>body{font:14px system-ui;max-width:1100px;margin:2rem auto}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.35rem;text-align:left}
+code{font-size:12px}.bad{color:#b00020}</style></head><body>
+<h1>CrowdGPT operator</h1><p id="summary">loading...</p>
+<table><thead><tr><th>node</th><th>endpoint</th><th>roles</th><th>version</th></tr></thead>
+<tbody id="nodes"></tbody></table>
+<h2>Lease</h2><pre id="lease"></pre>
+<h2>Audit chain</h2><pre id="chain"></pre>
+<script>
+async function j(u){const r=await fetch(u);return r.ok?r.json():{error:r.status}}
+async function main(){
+ const [c,n,s,a]=await Promise.all([j('/api/cluster'),j('/cluster/registry'),j('/fl/round_status'),j('/api/audit/chain')]);
+ document.getElementById('summary').textContent=
+   `round ${c.round} · lease ${c.lease?c.lease.leader+' ('+c.lease.term+')':'none'} · chain ${a.ok?'ok':'BROKEN'}`;
+ const tb=document.getElementById('nodes'); tb.innerHTML='';
+ for(const node of (n.nodes||[])){const tr=document.createElement('tr');
+  tr.innerHTML=`<td><code>${node.node_id}</code></td><td><code>${(node.endpoints||[]).join(', ')}</code></td>`+
+   `<td>${(node.roles||[]).join(', ')}</td><td>${node.software_version||''}</td>`;tb.appendChild(tr);}
+ document.getElementById('lease').textContent=JSON.stringify(c.lease,null,2);
+ document.getElementById('chain').textContent=JSON.stringify(a,null,2);
+}
+main();
+</script></body></html>""", media_type="text/html")
+
 @app.get("/api/cluster")
 async def cluster_view():
     if ORCH is None: return {"nodes": [], "healthy": [], "lease": None}
@@ -4263,7 +4501,13 @@ async def cluster_view():
             "round": round_state["current_round"],
             "lease": None if lease is None else {"leader": lease.leader,
                                                 "term": lease.term,
-                                                "expiresAt": lease.expires_at}}
+                                                "expiresAt": lease.expires_at},
+            "peer": None if PEER is None else {**PEER.health(), "configured": True},
+            "replicated": {
+                "tasks": len(ORCH.store.query("SELECT task_id FROM peer_tasks")),
+                "rounds": len(ORCH.store.query("SELECT round FROM peer_rounds")),
+                "submissions": len(ORCH.store.query("SELECT content_sha256 FROM peer_submissions")),
+            }}
 
 @app.get("/api/audit/rounds")
 async def audit_rounds():
@@ -4971,4 +5215,4 @@ if __name__ == "__main__":
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
+    uvicorn.run(app, host=os.getenv("CROWDGPT_HOST", "0.0.0.0"), port=PORT, log_level="info", access_log=False)

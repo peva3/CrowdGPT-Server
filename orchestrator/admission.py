@@ -114,6 +114,39 @@ class AdmissionService:
             return False
         return self.identity.verify(ticket.signing_payload(), ticket.signature, ticket.public_key)
 
+    def import_signed(self, ticket: TicketView) -> tuple[Optional[TicketView], bool]:
+        """Store a ticket signed by another orchestrator.
+
+        Returns ``(ticket, created)``.  A different ticket already held for the
+        same client is never overwritten; that would let a peer steal an
+        in-flight unit.  Re-announcing the identical ticket is idempotent.
+        """
+        if not self.verify(ticket):
+            return None, False
+        existing = self.get(ticket.client_key)
+        if existing is not None:
+            return (existing, False) if existing.ticket_id == ticket.ticket_id else (None, False)
+        now = time.time()
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO tickets(client_key,ticket_id,round,pool_id,task_id,created_at,"
+                "expires_at,step_budget,token_budget,nonce,base_weights,signature,public_key,"
+                "consumed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ticket.client_key, ticket.ticket_id, ticket.round, ticket.pool_id,
+                 ticket.task_id, ticket.created_at, ticket.expires_at,
+                 ticket.step_budget, ticket.token_budget, ticket.nonce,
+                 ticket.base_weights, ticket.signature, ticket.public_key,
+                 ticket.consumed_at),
+            )
+            conn.execute(
+                "INSERT INTO events(ts,kind,payload) VALUES(?,?,?)",
+                (now, "ticket_replicated",
+                 json.dumps({"client": ticket.client_key, "round": ticket.round,
+                             "ticket": ticket.ticket_id}, sort_keys=True,
+                            separators=(",", ":"))),
+            )
+        return self.get(ticket.client_key), True
+
     def load_all(self, round_no: Optional[int] = None) -> dict[str, TicketView]:
         if round_no is None:
             rows = self.store.query("SELECT * FROM tickets ORDER BY created_at")

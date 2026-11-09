@@ -9,3 +9,11 @@ public_events.jsonl
 public_log.json
 public_log_salt.txt
 loss_history.json
+.env
+data/
+pending_uploads/
+work_tmp/
+server.log
+orchestrator_node_key.next.pem
+*.sqlite3-wal
+*.sqlite3-shm

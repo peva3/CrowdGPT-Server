@@ -189,6 +189,28 @@ CREATE TABLE IF NOT EXISTS leases (
     acks TEXT NOT NULL DEFAULT '[]',
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS peer_tasks (
+    task_id TEXT PRIMARY KEY,
+    round INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS peer_rounds (
+    round INTEGER PRIMARY KEY,
+    state TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS peer_submissions (
+    content_sha256 TEXT PRIMARY KEY,
+    round INTEGER NOT NULL,
+    client_key TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS peer_nonces (
+    nonce TEXT PRIMARY KEY,
+    seen_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,

@@ -9,20 +9,28 @@ control-plane metadata only.
 
 ## Requirements
 
-- Linux, Python 3.12, 2 vCPU / 4 GB RAM minimum for the control plane.
+- Linux, Python 3.12, 2 vCPU minimum.
+- **RAM:** at least 8 GB for aggregation; 16 GB is comfortable. The 658M
+  float32 base plus 350M engram is 4.03 GB before copies, and a measured
+  aggregation pass peaked at 4.16 GB. The old 4 GB figure is too low.
 - A writable data directory; default is beside `server.py`.
 - Optional S3/R2 credentials for the data plane. Without them, the local
   presigned object endpoint is used (`/fl/object`).
+- A reachable endpoint for clients and peers: public IP, reverse proxy,
+  tunnel, or private mesh. Trainers need only outbound HTTPS; orchestrators
+  need inbound. There is no NAT traversal. See `docs/NG_NETWORKING.md`.
 
 ## First run
 
 ```bash
-python -m pip install -r requirements.txt   # fastapi, uvicorn, torch, cryptography, requests
+python -m pip install -r requirements.lock
 export CROWDGPT_ADMIN_SECRET='change-me'
 export CROWDGPT_PUBLIC_URL='https://node.example'
 export CROWDGPT_ORCHESTRATOR_DB=/var/lib/crowdgpt/state.sqlite3
 export CROWDGPT_OBJECT_DIR=/var/lib/crowdgpt/objects
+export CROWDGPT_PEERS_FILE=/var/lib/crowdgpt/peers.json
 python tools/operator_selfcheck.py
+python tools/orchestrator_cli.py doctor --dir /var/lib/crowdgpt
 python server.py
 ```
 
@@ -30,6 +38,24 @@ python server.py
 
 The first boot creates `orchestrator_node_key.pem` (0600). Back it up. Losing
 it means a new node id; do not share it.
+
+## Docker and systemd
+
+`docker compose up -d --build` uses `Dockerfile` and `docker-compose.yml` with
+a `/data` volume. `deploy/crowdgpt-orchestrator.service` is the non-Docker unit.
+Full instructions: `docs/DEPLOYMENT.md`.
+
+## Peer networking
+
+Set `CROWDGPT_PEERS` or `CROWDGPT_PEERS_FILE` to the static peer list. A lease
+is valid only after `CROWDGPT_PEER_QUORUM` peers acknowledge it; the default is
+a majority. `/cluster/health` reports the local view. Tickets and open-round
+snapshots are replicated, but a live training pool is still local to the node
+that created it.
+
+There is no hole punching, STUN/TURN, relay, or DNS discovery. If a node is
+behind NAT without a tunnel or mesh, peers cannot connect. See
+`docs/NG_NETWORKING.md`.
 
 ## Register and rotate
 

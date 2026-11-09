@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+checkpoints
+data
+pending_uploads
+work_tmp
+orchestrator_node_key.pem
+orchestrator_object_secret
+*.log
+.pytest_cache

@@ -16,6 +16,8 @@ with retrying/authenticated transport without changing the quorum rules.
 from __future__ import annotations
 
 import json
+import secrets
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -59,15 +61,25 @@ class PeerConfig:
 class HttpTransport:
     """POST one JSON object to a peer and return its JSON reply."""
 
-    def __init__(self, timeout_s: float = 2.0):
+    def __init__(self, timeout_s: float = 2.0, tls_verify: bool = True,
+                 ca_file: Optional[str] = None):
         self.timeout_s = float(timeout_s)
+        self.tls_verify = bool(tls_verify)
+        self.context = None
+        if not self.tls_verify:
+            self.context = ssl.create_default_context()
+            self.context.check_hostname = False
+            self.context.verify_mode = ssl.CERT_NONE
+        elif ca_file:
+            self.context = ssl.create_default_context(cafile=ca_file)
 
     def post(self, endpoint: str, path: str, body: dict) -> Optional[dict]:
         data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(endpoint.rstrip("/") + path, data=data, method="POST",
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout_s,
+                                        context=self.context) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
@@ -76,7 +88,8 @@ class HttpTransport:
     def get(self, endpoint: str, path: str) -> Optional[dict]:
         try:
             with urllib.request.urlopen(endpoint.rstrip("/") + path,
-                                        timeout=self.timeout_s) as resp:
+                                        timeout=self.timeout_s,
+                                        context=self.context) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
@@ -96,13 +109,16 @@ class ReplicatedLease:
     """Lease acquisition that requires a majority acknowledgement."""
 
     def __init__(self, store: StateStore, identity: NodeIdentity, config: PeerConfig,
-                 transport: Optional[HttpTransport] = None, ttl_s: float = 60.0):
+                 transport: Optional[HttpTransport] = None, ttl_s: float = 60.0,
+                 path_prefix: str = "/sim", envelope: bool = False):
         self.store = store
         self.identity = identity
         self.config = config
         self.transport = transport or HttpTransport()
         self.local = LeaseManager(store, ttl_s=ttl_s)
         self.ttl_s = float(ttl_s)
+        self.path_prefix = path_prefix.rstrip("/")
+        self.envelope = bool(envelope)
 
     def acquire(self, round_no: int, *, term: int = 1) -> Optional[Lease]:
         lease = self.local.acquire(round_no, self.config.node_id, term=term)
@@ -115,11 +131,14 @@ class ReplicatedLease:
         sig = sign_lease(self.identity, payload)
         acks = []
         for peer in self.config.peers:
-            reply = self.transport.post(peer.endpoint, "/sim/lease/ack", {
+            body = {
                 "lease": payload, "signature": sig,
                 "pubkey": self.identity.public_key_hex,
                 "requester": self.config.node_id,
-            })
+            }
+            if self.envelope:
+                body.update({"ts": time.time(), "nonce": secrets.token_hex(16)})
+            reply = self.transport.post(peer.endpoint, f"{self.path_prefix}/lease/ack", body)
             if (reply and reply.get("ack") and reply.get("node") == peer.node_id
                     and verify_client_receipt(payload, peer.pubkey,
                                               reply.get("sig", ""))):
@@ -162,20 +181,26 @@ class ReplicatedRegistry:
     """Signed node registration announced to peers."""
 
     def __init__(self, store: StateStore, identity: NodeIdentity, config: PeerConfig,
-                 transport: Optional[HttpTransport] = None):
+                 transport: Optional[HttpTransport] = None, path_prefix: str = "/sim",
+                 envelope: bool = False):
         self.store = store
         self.identity = identity
         self.config = config
         self.transport = transport or HttpTransport()
         self.registry = NodeRegistry(store)
+        self.path_prefix = path_prefix.rstrip("/")
+        self.envelope = bool(envelope)
+        self.envelope = bool(envelope)
 
     def publish(self, record: dict, signature: str) -> Optional[Node]:
         node = self.registry.register_signed(record, signature)
         if node is None:
             return None
         for peer in self.config.peers:
-            self.transport.post(peer.endpoint, "/sim/registry/announce", {
-                "record": record, "signature": signature})
+            body = {"record": record, "signature": signature}
+            if self.envelope:
+                body.update({"ts": time.time(), "nonce": secrets.token_hex(16)})
+            self.transport.post(peer.endpoint, f"{self.path_prefix}/registry/announce", body)
         return node
 
     def accept(self, record: dict, signature: str) -> Optional[Node]:

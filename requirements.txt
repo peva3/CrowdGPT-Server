@@ -4,7 +4,7 @@ requests
 numpy
 torch
 cryptography
-slowapi
+slowapi==0.1.10  # optional; server.py falls back if absent
 psutil
 huggingface_hub
 safetensors

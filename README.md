@@ -16,12 +16,13 @@ The client lives in the main repository. For the model and training setup, see [
 ## Requirements
 
 - Python 3 and a machine with enough disk for checkpoints and pending deltas. The server refuses new tasks below 10 GB free and new uploads below 2 GB.
-- `fastapi`, `uvicorn`, `torch`, `numpy`, `requests`, `slowapi`, `huggingface_hub`, `safetensors`. `psutil` is optional.
+- `fastapi`, `uvicorn`, `torch`, `numpy`, `requests`, `huggingface_hub`, `safetensors`. `psutil` is optional. `slowapi` is optional; the server falls back to a no-op limiter when it is absent.
+- For aggregation, size by memory, not the old 4 GB figure: the 658M float32 base plus 350M engram alone is 4.03 GB. A measured pass peaked at 4.16 GB before streaming/merge overhead; use at least 8 GB RAM (16 GB comfortable). See `tools/bench_aggregation_memory.py`.
 
 ## Running
 
 ```bash
-pip install fastapi uvicorn torch numpy requests slowapi huggingface_hub safetensors psutil
+pip install -r requirements.lock
 
 export CROWDGPT_ADMIN_SECRET="$(openssl rand -hex 32)"
 export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
@@ -29,9 +30,22 @@ export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
 python server.py                 # listens on 0.0.0.0:5006
 ```
 
-Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files).
+Or use the operator CLI and packaging:
 
-If the server sits behind a reverse proxy or tunnel, set `CROWDGPT_TRUSTED_PROXIES` to the proxy's address range. Otherwise every client appears to come from the proxy, which breaks per-IP limits and bans.
+```bash
+python tools/orchestrator_cli.py init --dir /var/lib/crowdgpt \
+  --public-url https://node.example
+python tools/orchestrator_cli.py doctor --dir /var/lib/crowdgpt
+python tools/orchestrator_cli.py run --dir /var/lib/crowdgpt
+
+# or
+docker compose up -d --build
+```
+
+Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files). Docker uses
+the JSON log driver; configure rotation there.
+
+If the server sits behind a reverse proxy or tunnel, set `CROWDGPT_TRUSTED_PROXIES` to the proxy's address range. Otherwise every client appears to come from the proxy, which breaks per-IP limits and bans. **TLS is not built in**; terminate it at Caddy/Nginx/a tunnel. See `docs/NG_NETWORKING.md` and `docs/DEPLOYMENT.md`.
 
 ## Configuration
 
@@ -79,7 +93,12 @@ All settings are environment variables. Defaults are the values used when the va
 |---|---|---|
 | `CROWDGPT_ADMIN_SECRET` | | Secret for `/api/admin/*`. Always set it |
 | `HF_TOKEN` | | Hugging Face write token |
-| `CROWDGPT_PUBLIC_URL` | `https://server.crowdgpt.net` | URL the server advertises to clients |
+| `CROWDGPT_PUBLIC_URL` | `https://server.crowdgpt.net` | URL the server advertises to clients and peers |
+| `CROWDGPT_PEERS` / `CROWDGPT_PEERS_FILE` | empty | Static peer list: `[{"node_id","endpoint","pubkey"}]` |
+| `CROWDGPT_PEER_QUORUM` | majority | Lease/witness quorum; defaults to `(peers+1)//2 + 1` |
+| `CROWDGPT_PEER_TLS_VERIFY` | `1` | Verify HTTPS peer certificates; `0` is dev-only |
+| `CROWDGPT_PEER_CA_FILE` | empty | Custom CA bundle for peer HTTPS |
+| `CROWDGPT_HOST` / `CROWDGPT_PORT` | `0.0.0.0` / `5006` | Listen address |
 
 A few more tuning variables are read in `server.py` (search for `_env_int` and `_env_float`).
 
@@ -95,6 +114,9 @@ Routes used by the client:
 | `POST /fl/submit/init`, `/chunk`, `/finalize` | Chunked delta upload |
 | `POST /auth/register`, `/auth/login`, `GET /auth/me` | Accounts |
 | `GET /api/stats`, `/api/leaderboard`, `/api/model_info` | Public stats |
+| `GET /cluster/health`, `/cluster/registry` | Peer liveness and signed node registry |
+| `POST /cluster/lease/ack`, `/cluster/registry/announce`, `/cluster/ticket/announce`, `/cluster/round/announce`, `/cluster/submission/announce`, `/cluster/witness/sign` | Peer replication |
+| `GET /operator`, `/audit` | Operator and audit pages |
 
 Routes under `/api/admin/` require the admin secret.
 
@@ -107,7 +129,7 @@ Routes under `/api/admin/` require the admin secret.
 | `pending_uploads/` | Chunked uploads in progress (expire after 6 h) |
 | `users.json` | Accounts, stats and flags |
 
-Tasks and pools are kept in memory only: a restart drops every task in progress, and clients get a fresh one on their next request.
+Round, pool, membership, task, ticket, upload, submission, verification, publication, registry, lease, reputation, and peer-replication state are in `orchestrator_state.sqlite3` (WAL). A restart reconstructs the open round and live tickets; a closed round is not resurrected. Signed peer tickets and task snapshots survive in the same database.
 
 ## Security
 
